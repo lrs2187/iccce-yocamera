@@ -1,0 +1,12 @@
+{
+  "DeviceIp": "127.0.0.1",
+  "LocalBindIp": "127.0.0.1",
+  "PairingCode": "",
+  "Resolution": "1280x720",
+  "FrameRate": 30,
+  "FfmpegPath": "",
+  "VcamDeviceName": "",
+  "VcamDllPath": "",
+  "AutoInstallVcamOnStartup": false,
+  "AutoStartSessionOnBoothOpen": true
+}

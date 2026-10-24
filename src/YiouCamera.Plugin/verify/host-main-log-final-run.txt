@@ -1,0 +1,14 @@
+2026-10-24T14:56:44.7304321+08:00 [T2] [Trace] [Ink_Canvas.App..ctor] App | 构造函数入口 pid=17640 args=[C:\Users\lrs2187\Applications\InkCanvasForClass.CE.1.8.0.11-x64\InkCanvasForClass.dll]
+2026-10-24T14:56:46.7684559+08:00 [T2] [Warning] [<startup>] ToolbarRegistry: 未找到条目 [function.insert]
+2026-10-24T14:56:46.7700625+08:00 [T2] [Warning] [<startup>] ToolbarRegistry: 未找到条目 [sample.button]
+2026-10-24T14:56:46.7712187+08:00 [T2] [Warning] [<startup>] ToolbarRegistry: 未找到条目 [com.yiou.boothcam.open]
+2026-10-24T14:56:47.2446656+08:00 [T2] [Warning] [<startup>] ToolbarRegistry: 未找到条目 [function.insert]
+2026-10-24T14:56:47.2872516+08:00 [T2] [Warning] [<startup>] ToolbarRegistry: 未找到条目 [sample.button]
+2026-10-24T14:56:47.3105264+08:00 [T2] [Warning] [<startup>] ToolbarRegistry: 未找到条目 [com.yiou.boothcam.open]
+2026-10-24T14:56:47.6186656+08:00 [T2] [Warning] [<startup>] BoardToolbarRegistry: 未找到组件 [board.math]
+2026-10-24T14:56:48.1428878+08:00 [T2] [Trace] [Ink_Canvas.Windows.SettingsViews.Helpers.WindowSettingsHelper.StartTopmostMaintenance] 启动置顶维护定时器
+2026-10-24T14:56:48.3966546+08:00 [T2] [Trace] [Ink_Canvas.Windows.SettingsViews.Helpers.WindowSettingsHelper.StartTopmostMaintenance] 启动置顶维护定时器
+2026-10-24T14:56:48.4509822+08:00 [T2] [Error] [Ink_Canvas.Helpers.FileAssociationManager.RegisterFileAssociation] 注册文件关联时访问被拒绝: Access to the registry key 'HKEY_CLASSES_ROOT\InkCanvasStrokesFile' is denied.
+2026-10-24T14:56:48.8346274+08:00 [T2] [Trace] [Ink_Canvas.MainWindow.LoadInkFadeSettings] 墨迹渐隐设置已加载
+2026-10-24T14:56:48.8762730+08:00 [T2] [Trace] [Ink_Canvas.MainWindow.LoadBrushAutoRestoreSettings] 画笔自动恢复设置已加载
+2026-10-24T14:56:48.9003153+08:00 [T2] [Trace] [Ink_Canvas.MainWindow.AddTouchSupportToSliders] 已为所有滑块控件添加触摸支持

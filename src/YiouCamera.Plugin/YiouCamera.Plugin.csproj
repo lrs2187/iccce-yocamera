@@ -1,0 +1,95 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- YiouCamera.Plugin = ICCCE（InkCanvasForClass CE）插件本体。
+       接入方式只有一种：camera provider（宿主 API >= 1.14.0），纯托管、零系统安装。
+       产物：manifest.json + YiouCamera.Plugin.dll + .deps.json（3 文件）。
+       硬约束：输出目录绝不能出现 InkCanvas.PluginSdk.dll / InkCanvas.Controls.dll，
+       否则插件 ALC 会加载出第二份 IPlugin 类型，导致加载失败。 -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <OutputType>Library</OutputType>
+    <AssemblyName>YiouCamera.Plugin</AssemblyName>
+    <RootNamespace>YiouCamera.Plugin</RootNamespace>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <LangVersion>latest</LangVersion>
+    <AppendTargetFrameworkToOutputPath>true</AppendTargetFrameworkToOutputPath>
+
+    <Version>0.3.0</Version>
+    <AssemblyVersion>0.3.0.0</AssemblyVersion>
+    <FileVersion>0.3.0.0</FileVersion>
+    <Product>驿欧无线展台 ICCCE 插件</Product>
+    <Company>iccce-yocamera</Company>
+
+    <CreateIcpx>false</CreateIcpx>
+    <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
+    <DebugSymbols Condition="'$(Configuration)' == 'Release'">false</DebugSymbols>
+
+    <!-- Core 采集内核（发现/控制/RTSP/解码）。 -->
+    <YiouCoreProject>$(MSBuildThisFileDirectory)..\YiouCamera.Core\YiouCamera.Core.csproj</YiouCoreProject>
+    <YiouUseCore Condition="'$(YiouUseCore)' == '' and Exists('$(YiouCoreProject)')">true</YiouUseCore>
+    <YiouUseCore Condition="'$(YiouUseCore)' == ''">false</YiouUseCore>
+    <DefineConstants Condition="'$(YiouUseCore)' == 'true'">$(DefineConstants);YIOU_HAS_CORE</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 官方 SDK NuGet 包（camera provider 接口通过运行时反射探测，编译期只依赖旧 API）。
+         ExcludeAssets=runtime：SDK dll 不复制到插件输出/包内（宿主默认 ALC 已内嵌一份）。 -->
+    <PackageReference Include="InkCanvas.PluginSdk" Version="1.8.0.11-gcaf5b75f81">
+      <ExcludeAssets>runtime</ExcludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(YiouUseCore)' == 'true'">
+    <ProjectReference Include="$(YiouCoreProject)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="manifest.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="YiouReportBuildMode" BeforeTargets="Build">
+    <Message Importance="high" Text="[YiouCamera.Plugin] Core=$(YiouUseCore) Mode=camera-provider-only" />
+  </Target>
+
+  <!-- 把 YiouCamera.Core.dll 合并进入口 dll（ILRepack）：产物保持 3 文件，且不会触发宿主的
+       「外部 DLL 授权」弹窗。找不到 ILRepack 时只告警，不阻断 build。
+       关闭方式：-p:YiouMergeCore=false（此时需把 YiouCamera.Core.dll 一并装进插件目录）。 -->
+  <PropertyGroup>
+    <YiouIlrepackExe Condition="'$(YiouIlrepackExe)' == ''">$(USERPROFILE)\.dotnet\tools\ilrepack.exe</YiouIlrepackExe>
+  </PropertyGroup>
+
+  <Target Name="YiouMergeCoreIntoPlugin"
+          AfterTargets="Build"
+          Condition="'$(YiouUseCore)' == 'true' and '$(YiouMergeCore)' != 'false' and '$(Configuration)' == 'Release' and Exists('$(YiouIlrepackExe)')">
+    <PropertyGroup>
+      <YiouMergeDir>$(TargetDir)yiou_merge\</YiouMergeDir>
+      <YiouCompiledDll>$([System.IO.Path]::GetFullPath('$(IntermediateOutputPath)$(TargetFileName)'))</YiouCompiledDll>
+      <YiouCoreDll>$(TargetDir)YiouCamera.Core.dll</YiouCoreDll>
+      <YiouMergeLibs>/lib:&quot;$(NetCoreTargetingPackRoot)\Microsoft.WindowsDesktop.App.Ref\$(BundledNETCoreAppPackageVersion)\ref\net10.0&quot; /lib:&quot;$(NetCoreTargetingPackRoot)\Microsoft.NETCore.App.Ref\$(BundledNETCoreAppPackageVersion)\ref\net10.0&quot; /lib:&quot;$(NuGetPackageRoot)inkcanvas.pluginsdk\1.8.0.11-gcaf5b75f81\lib\net10.0-windows10.0.19041&quot; /lib:&quot;$(NuGetPackageRoot)microsoft.extensions.dependencyinjection.abstractions\6.0.0\lib\net6.0&quot;</YiouMergeLibs>
+    </PropertyGroup>
+
+    <MakeDir Directories="$(YiouMergeDir)" />
+    <Exec Command="&quot;$(YiouIlrepackExe)&quot; /out:&quot;$(YiouMergeDir)$(TargetFileName)&quot; $(YiouMergeLibs) &quot;$(YiouCompiledDll)&quot; &quot;$(YiouCoreDll)&quot;"
+          WorkingDirectory="$(TargetDir)"
+          ContinueOnError="WarnAndContinue" />
+
+    <Copy SourceFiles="$(YiouMergeDir)$(TargetFileName)" DestinationFiles="$(TargetPath)"
+          Condition="Exists('$(YiouMergeDir)$(TargetFileName)')" />
+    <Delete Files="$(YiouCoreDll);$(TargetDir)YiouCamera.Core.pdb"
+            Condition="Exists('$(YiouMergeDir)$(TargetFileName)')" />
+    <Message Importance="high"
+             Text="[YiouCamera.Plugin] 已把 YiouCamera.Core 合并进入口 dll（产物 3 文件）。"
+             Condition="Exists('$(YiouMergeDir)$(TargetFileName)')" />
+    <Warning Text="[YiouCamera.Plugin] ILRepack 合并 Core 失败：入口 dll 未合并，安装时需同时放 YiouCamera.Core.dll。"
+             Condition="!Exists('$(YiouMergeDir)$(TargetFileName)')" />
+    <RemoveDir Directories="$(YiouMergeDir)" />
+  </Target>
+
+</Project>
