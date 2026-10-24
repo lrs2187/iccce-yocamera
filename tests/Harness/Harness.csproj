@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <AssemblyName>YiouCamera.Harness</AssemblyName>
+    <RootNamespace>YiouCamera.Harness</RootNamespace>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <!-- WPFMediaKit 是从宿主里解包出来的 net10 兼容程序集 -->
+    <NoWarn>$(NoWarn);MSB3277;NU1701</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="DirectShowLib.Net" Version="3.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="WPFMediaKit">
+      <HintPath>..\..\_research\wpfmediakit\WPFMediaKit.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
