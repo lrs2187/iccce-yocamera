@@ -1,4 +1,4 @@
-﻿# 一键构建：Core + Plugin → build\out\plugin\（3 文件：manifest.json / 插件 dll / deps.json）
+# 一键构建：Core + Plugin → build\out\plugin\（3 文件：manifest.json / 插件 dll / deps.json）
 # 用法: pwsh -NoProfile -ExecutionPolicy Bypass -File tools\build-all.ps1 [-Configuration Release]
 param([string]$Configuration = "Release")
 $ErrorActionPreference = "Stop"
@@ -34,6 +34,11 @@ foreach ($f in @("InkCanvas.PluginSdk.dll", "InkCanvas.Controls.dll", "WinRT.Run
 }
 $extra = Get-ChildItem $plugOut -File | Where-Object { $_.Name -notin $need }
 if ($extra) { Write-Warning "输出目录出现预期之外的文件：$($extra.Name -join ', ')" }
+
+# 冒烟测试：设置页构建路径必须能跑通（v0.3.0 曾因 NewButton 自递归让宿主打开设置就闪退）
+Write-Host "`n=== 4/4 设置页冒烟测试（独立进程）===" -ForegroundColor Cyan
+& pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "tools\run-settings-smoke.ps1")
+if ($LASTEXITCODE -ne 0) { throw "设置页冒烟测试失败，产物不可分发（宿主打开设置页会崩溃）" }
 
 Write-Host "`n[DONE] 产物：" -ForegroundColor Green
 Get-ChildItem $plugOut -File | Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize

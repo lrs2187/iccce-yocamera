@@ -1,0 +1,30 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- 设置页冒烟测试：在独立进程里构造插件设置页（SettingsView），验证构建路径不炸。
+       单独进程是必须的：StackOverflowException 无法被 catch，会直接带走进程，
+       所以"进程没崩 + 输出 SMOKE-OK"就是通过判据。
+       背景：v0.3.0 的 SettingsView.NewButton 同名重载被 async lambda 决议成自递归，
+       宿主一打开「设置 → 插件」就 0xC00000FD 崩溃，宿主里完全看不出是我们的问题。 -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>YiouCamera.SettingsSmoke</AssemblyName>
+    <RootNamespace>YiouCamera.SettingsSmoke</RootNamespace>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <LangVersion>latest</LangVersion>
+    <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 只为拿到 IPluginHost 等接口类型来写假宿主；运行时用不到它的实现。 -->
+    <PackageReference Include="InkCanvas.PluginSdk" Version="1.8.0.11-gcaf5b75f81" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="6.0.0" />
+  </ItemGroup>
+
+</Project>
