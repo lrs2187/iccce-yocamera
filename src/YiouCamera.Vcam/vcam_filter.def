@@ -1,0 +1,10 @@
+; vcam_filter.def - control the DLL export table explicitly.
+; Without this, MSVC does not export the COM registration entry points and both
+; regsvr32 and CoCreateInstance-driven activation of the filter fail.
+LIBRARY vcam_filter
+EXPORTS
+    DllCanUnloadNow     PRIVATE
+    DllGetClassObject   PRIVATE
+    DllRegisterServer   PRIVATE
+    DllUnregisterServer PRIVATE
+    DllInstall          PRIVATE
