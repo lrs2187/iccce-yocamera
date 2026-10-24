@@ -47,6 +47,12 @@ jobs:
           }
           Get-ChildItem $bin -File | Select-Object Name, Length | Format-Table -AutoSize
 
+      # v0.3.0 事故回归：设置页按钮构造自递归 → 宿主打开「设置 → 插件」即 0xC00000FD。
+      # StackOverflow 无法 catch，必须靠独立进程 + 退出码判断。
+      - name: 设置页冒烟测试（独立进程）
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/run-settings-smoke.ps1
+
       - name: 安装 ffmpeg（仿真器 selftest 需要）
         run: choco install ffmpeg -y --no-progress
 
