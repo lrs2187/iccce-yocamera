@@ -3,13 +3,21 @@
 把 **驿欧无线视频展台**（YiouBoard 2.0 无线实物展台）接入 ICCCE 内置视频展台。
 纯托管、仅宿主内可见、**零系统安装**（不注册虚拟摄像头、不写注册表、不需要管理员权限）。
 
+## 发行物
+
+| 文件 | 大小 | SHA256 | 说明 |
+|---|---|---|---|
+| `com.yiou.boothcam-0.3.0.icpx` | 77.8 KB | `16886230a307c3108a0ade94b5e2569b3095523925e937026cfd46f15cca22c0` | 标准 ICCCE 插件包（仅 3 文件） |
+| `ICCCE-Patched-1.8.0.11-camera-provider-win-x64.zip` | 80.6 MB | `e1025fa510f93e9dac0d8494b6e44cbea6335fd0603c46ec8a553a313fe67626` | 带 camera provider 补丁的宿主，**已内置插件**，解压即用 |
+
+> 官方原版 1.8.0.11 **不支持** provider，必须用补丁版宿主；等 [PR #739](https://github.com/InkCanvasForClass/community/pull/739) 合并后，只需 `.icpx`。
+
 ## 安装
 
-1. **先确认宿主带 camera provider 接口**（`ApiVersion ≥ 1.14.0`）：
-   - 官方版 1.8.0.11 **不支持**，需要打补丁版宿主（见下）或等 [PR #739](https://github.com/InkCanvasForClass/community/pull/739) 合并后的版本；
-2. 宿主「设置 → 插件 → 从本地安装」选择本 `.icpx`；
-   （或把 `.icpx` 放进 `<宿主目录>\PluginPackages\` 后重启，首次可能需要在设置页确认安装）
-3. 重启宿主 → 浮动栏出现「驿欧展台」按钮 → 点它。
+**方式 A（推荐，一步到位）**：下载 `ICCCE-Patched-...zip` → 解压到任意目录（如 `D:\ICCCE-Patched`）→ 双击 `InkCanvasForClass.exe`。
+
+**方式 B（已有补丁版宿主）**：用 `.icpx`，宿主「设置 → 插件 → 从本地安装」；
+或放进 `<宿主目录>\PluginPackages\` 后重启。
 
 ## 使用
 
