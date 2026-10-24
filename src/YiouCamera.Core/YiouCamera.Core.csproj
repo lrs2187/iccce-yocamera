@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    YiouCamera.Core - 驿欧无线视频展台采集内核（发现 / 控制 / RTSP 解码 / 共享内存）
+    - 目标 net10.0，纯托管，无 WPF、无 ICCCE SDK、无第三方 NuGet 依赖
+    - 契约见 docs/CONTRACTS.md §3；协议见 _research/yocam-protocol.md
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>YiouCamera.Core</AssemblyName>
+    <RootNamespace>YiouCamera.Core</RootNamespace>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <!-- 命名共享内存（Local\...）仅 Windows；产品本身 Windows-only，TFM 按契约保持 net10.0 -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+
+</Project>

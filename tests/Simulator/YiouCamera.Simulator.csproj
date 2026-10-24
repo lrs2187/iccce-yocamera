@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    YiouCamera.Simulator - 设备端仿真器（无真机闭环验证）
+    - UDP 12811 发现应答 / TCP 8888 控制+心跳+开流 ACK / 最小 RTSP(MJPEG/RTP-UDP) 服务
+    - selftest：发现→连接→心跳→开流→ffmpeg 解码出帧→写共享内存→回读校验
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>YiouCamera.Simulator</AssemblyName>
+    <RootNamespace>YiouCamera.Simulator</RootNamespace>
+    <!-- 命名共享内存仅 Windows -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\YiouCamera.Core\YiouCamera.Core.csproj" />
+  </ItemGroup>
+
+</Project>
