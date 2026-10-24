@@ -16,7 +16,7 @@ namespace YiouCamera.Plugin.UI
     /// 插件设置页（纯代码构建，避免插件 ALC 下 XAML 解析的额外依赖风险）。
     /// 宿主在「设置 → 插件 → 驿欧无线展台」里渲染本控件。
     /// 页面元素：
-    ///   - 虚拟摄像头：注册状态 / 安装修复 / 卸载 / 刷新 / 摄像头枚举结果
+    ///   - 接入模式：provider 激活状态 / 帧统计 / 宿主机位枚举结果 / 刷新 / 日志目录
     ///   - 采集会话：状态 / 连接 / 断开 / 打开宿主视频展台 / 抓取最近帧插入画布
     ///   - 设备与取流：设备 IP / 本机网卡 / 配对码 / 分辨率 / 帧率 / ffmpeg 路径 / 自动行为
     ///   - 日志目录 / 保存配置
@@ -86,8 +86,9 @@ namespace YiouCamera.Plugin.UI
 
             root.Children.Add(new TextBlock
             {
-                Text = "宿主支持 camera provider（API ≥ 1.14.0）时走纯托管「插件摄像头」，预览/拍照/旋转由宿主负责；"
-                       + "旧宿主自动回退「虚拟 DirectShow 摄像头」兼容模式。点工具栏「驿欧展台」即可带着本设备打开展台。",
+                Text = "需要宿主支持 camera provider（API ≥ 1.14.0）：画面以纯托管「插件摄像头」形式出现在宿主视频展台里，"
+                       + "预览/拍照/旋转都由宿主负责，本插件不注册任何系统组件。官方 1.8.0.11 还没有该 API，"
+                       + "请使用带 provider 的宿主构建；点工具栏「驿欧展台」即可带着本设备打开展台。",
                 TextWrapping = TextWrapping.Wrap,
                 Opacity = 0.75,
                 Margin = new Thickness(0, 0, 0, 12),
@@ -100,15 +101,15 @@ namespace YiouCamera.Plugin.UI
 
             _cameraListText = NewStatusText(modePanel);
             var modeButtons = NewButtonRow(modePanel);
-            _refreshButton = NewButton(modeButtons, "刷新状态", async (_, __) => await RefreshAsync());
+            _refreshButton = NewButtonAsync(modeButtons, "刷新状态", async (_, __) => await RefreshAsync());
             NewButton(modeButtons, "打开日志目录", (_, __) => OpenLogFolder());
 
             // ---- 采集会话 ----
             var sessionPanel = NewSection(root, "采集会话（发现 → TCP 控制 → RTSP → 共享内存喂帧）");
             _sessionStatusText = NewStatusText(sessionPanel);
             var sessionButtons = NewButtonRow(sessionPanel);
-            _connectButton = NewButton(sessionButtons, "连接设备 / 启动采集", async (_, __) => await ConnectAsync());
-            _disconnectButton = NewButton(sessionButtons, "断开采集", async (_, __) => await DisconnectAsync());
+            _connectButton = NewButtonAsync(sessionButtons, "连接设备 / 启动采集", async (_, __) => await ConnectAsync());
+            _disconnectButton = NewButtonAsync(sessionButtons, "断开采集", async (_, __) => await DisconnectAsync());
             NewButton(sessionButtons, "打开宿主视频展台", (_, __) => _rt.OpenBooth());
             NewButton(sessionButtons, "抓取最近帧插入画布", (_, __) => _rt.CaptureLatestFrameToCanvas());
 
@@ -260,9 +261,13 @@ namespace YiouCamera.Plugin.UI
             return button;
         }
 
-        private static Button NewButton(StackPanel row, string text, Func<object, RoutedEventArgs, Task> onClickAsync)
+        // 注意：必须与上面的 RoutedEventHandler 重载区分名字。
+        // 若两者同名，async lambda 的重载决议会优先选 Func<...,Task> 版本，
+        // 本方法内部的 async lambda 会再次绑定回自身 —— 编译期自递归，
+        // 打开设置页时直接 StackOverflowException 带崩宿主（v0.3.0 事故）。
+        private static Button NewButtonAsync(StackPanel row, string text, Func<object, RoutedEventArgs, Task> onClickAsync)
         {
-            return NewButton(row, text, async (sender, args) =>
+            RoutedEventHandler handler = async (sender, args) =>
             {
                 try
                 {
@@ -272,7 +277,9 @@ namespace YiouCamera.Plugin.UI
                 {
                     Debug.WriteLine("[YiouCamera] 设置页按钮异常: " + ex);
                 }
-            });
+            };
+
+            return NewButton(row, text, handler);
         }
 
         private static TextBox AddRow(Grid grid, ref int row, string label)
