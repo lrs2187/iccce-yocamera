@@ -20,11 +20,15 @@
 
 | 目录/文件 | 说明 |
 |---|---|
-| `build/patched-host/` | 打了 camera provider 补丁的 ICCCE（**整个目录**，约 170 MB / 70 文件） |
-| `build/patched-host/Plugins/com.yiou.boothcam/` | 插件（manifest.json + YiouCamera.Plugin.dll + deps.json，约 173 KB） |
+| `build/patched-host/` | 打了 camera provider 补丁的 ICCCE（**整个目录**，约 170 MB / 198 文件） |
+| `build/patched-host/Plugins/com.yiou.boothcam/` | 插件 **v0.3.1**（manifest.json + YiouCamera.Plugin.dll + deps.json，约 175 KB） |
 | `docs/HANDOFF.md` | 本文件 |
 
 > 插件若不在 `Plugins/` 里，手工建目录 `Plugins\com.yiou.boothcam\` 把三个文件放进去即可。
+> 另外交付了 `com.yiou.boothcam-0.3.1.icpx`（宿主内「设置 → 插件 → 从本地安装」）和
+> `ICCCE-Patched-…-win-x64.zip`（已内置插件的压缩版宿主），任选其一即可。
+>
+> **务必用 0.3.1 或更新**：v0.3.0 的插件只要在宿主里打开「设置 → 插件」就会让宿主闪退（栈溢出，已修）。
 
 ---
 
@@ -58,6 +62,7 @@
 
 | # | 检查 | 期望 |
 |---|---|---|
+| 0 | **打开「设置 → 插件 → 驿欧无线展台」**（v0.3.0 的崩溃点，先点一次） | 设置页正常出现，宿主不闪退（应显示 provider 激活状态 / 设备与取流设置） |
 | 1 | 插件是否加载 | `PluginLogs\com.yiou.boothcam\<日期>.log` 有 `接入模式：camera provider 注册成功` |
 | 2 | 系统是否干净 | 注册表 `HKCU\Software\Classes\CLSID\{9A3E7D21-…}` **不存在**；`%LOCALAPPDATA%\ICC-CE` **不存在** |
 | 3 | 摄像头是否出现在下拉框 | 列表里有 `驿欧无线展台（插件）` |
@@ -73,6 +78,7 @@
 
 | 现象 | 排查 |
 |---|---|
+| 打开「设置 → 插件」宿主**直接闪退** | 装的是 v0.3.0（栈溢出 bug）。换 `com.yiou.boothcam-0.3.1.icpx`：退出宿主 → 覆盖 `Plugins\com.yiou.boothcam\` 三个文件 → 重启。 |
 | 日志 `宿主不支持 camera provider（需要 API ≥ 1.14.0）` | 用的是**官方原版**宿主，不是 `patched-host`。改用交付目录里的那个 exe。 |
 | 一直 `Discovering` 找不到设备 | ① 展台是否开机/连同一网络；② 多网卡/VPN 时在插件设置里指定本机网卡 IP；③ 配对码是否与设备匹配（见下） |
 | `找不到 ffmpeg.exe` | 按 §2.4 把 ffmpeg.exe 放进插件目录，或在插件设置页填绝对路径 |

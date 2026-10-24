@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <!-- YiouCamera.Plugin = ICCCE（InkCanvasForClass CE）插件本体。
        接入方式只有一种：camera provider（宿主 API >= 1.14.0），纯托管、零系统安装。
@@ -20,9 +20,9 @@
     <LangVersion>latest</LangVersion>
     <AppendTargetFrameworkToOutputPath>true</AppendTargetFrameworkToOutputPath>
 
-    <Version>0.3.0</Version>
-    <AssemblyVersion>0.3.0.0</AssemblyVersion>
-    <FileVersion>0.3.0.0</FileVersion>
+    <Version>0.3.1</Version>
+    <AssemblyVersion>0.3.1.0</AssemblyVersion>
+    <FileVersion>0.3.1.0</FileVersion>
     <Product>驿欧无线展台 ICCCE 插件</Product>
     <Company>iccce-yocamera</Company>
 

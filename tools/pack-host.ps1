@@ -37,7 +37,7 @@ try {
     }
 
     # 附带文档与入口说明
-    $docs = @("HANDOFF.md", "release-notes-v0.3.0.md")
+    $docs = @("HANDOFF.md", "release-notes-v0.3.1.md", "release-notes-v0.3.0.md")
     foreach ($d in $docs) {
         $p = Join-Path $root "docs\$d"
         if (Test-Path $p) { Copy-Item $p (Join-Path $staging "docs-$d") -Force }

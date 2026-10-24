@@ -1,7 +1,7 @@
 {
   "Id": "com.yiou.boothcam",
   "Name": "驿欧无线展台",
-  "Version": "0.3.0",
+  "Version": "0.3.1",
   "Description": "把驿欧无线视频展台（UDP 发现 + TCP 控制 + RTSP 取流）通过 ICCCE 的 camera provider 接口接入内置视频展台：纯托管、仅宿主内可见、零系统安装、随插件卸载即消失。",
   "Author": "iccce-yocamera",
   "EntranceAssembly": "YiouCamera.Plugin.dll",
