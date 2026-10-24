@@ -1,0 +1,2367 @@
+diff --git a/Ink Canvas/App.xaml.cs b/Ink Canvas/App.xaml.cs
+index ffacb8e9..902b9384 100644
+--- a/Ink Canvas/App.xaml.cs	
++++ b/Ink Canvas/App.xaml.cs	
+@@ -1,4 +1,4 @@
+-﻿using H.NotifyIcon;
++using H.NotifyIcon;
+ using Ink_Canvas.Helpers;
+ using Ink_Canvas.Plugins;
+ using Ink_Canvas.Properties;
+@@ -373,6 +373,7 @@ namespace Ink_Canvas
+                 (typeof(Plugins.INameRosterService),      new Plugins.NameRosterService()),
+                 (typeof(Plugins.IInkEffectService),       new Plugins.InkEffectService(mainWindow)),
+                 (typeof(Plugins.ICameraService),          new Plugins.CameraService()),
++                (typeof(Plugins.ICameraProviderService),  new Plugins.CameraProviderService()),
+                 (typeof(Plugins.IVideoBoothService),      new Plugins.VideoBoothService(mainWindow)),
+                 (typeof(Plugins.ISystemInfoService),      new Plugins.SystemInfoService()),
+                 (typeof(Plugins.IBackupService),          new Plugins.BackupService()),
+diff --git a/Ink Canvas/Helpers/CameraProviderRegistry.cs b/Ink Canvas/Helpers/CameraProviderRegistry.cs
+new file mode 100644
+index 00000000..e0974540
+--- /dev/null
++++ b/Ink Canvas/Helpers/CameraProviderRegistry.cs	
+@@ -0,0 +1,556 @@
++using Ink_Canvas.Plugins;
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Windows;
++using System.Windows.Media;
++using System.Windows.Media.Imaging;
++
++namespace Ink_Canvas.Helpers
++{
++    /// <summary>
++    /// 已注册到宿主的插件摄像头（camera provider）。
++    /// 一个 <see cref="IPluginCameraProvider"/> 声明 N 个 <see cref="PluginCameraDescriptor"/>，
++    /// 每个描述对应本类型的一个实例。
++    /// </summary>
++    public sealed class ProviderCameraRegistration
++    {
++        internal ProviderCameraRegistration(IPluginCameraProvider provider, PluginCameraDescriptor descriptor)
++        {
++            Provider = provider;
++            Descriptor = descriptor;
++            Id = descriptor.Id;
++            Key = BuildKey(provider.ProviderId, descriptor.Id);
++        }
++
++        /// <summary>提供者实现。</summary>
++        public IPluginCameraProvider Provider { get; }
++
++        /// <summary>摄像头描述（插件在 GetCameras 中返回的对象）。</summary>
++        public PluginCameraDescriptor Descriptor { get; }
++
++        /// <summary>提供者 Id（<see cref="IPluginCameraProvider.ProviderId"/>）。</summary>
++        public string ProviderId => Provider?.ProviderId ?? "";
++
++        /// <summary>摄像头 Id（<see cref="PluginCameraDescriptor.Id"/>）。</summary>
++        public string Id { get; }
++
++        /// <summary>宿主内部使用的唯一键（用于 CameraInfo.MonikerString 与日志）。</summary>
++        public string Key { get; }
++
++        /// <summary>下拉框显示名；插件未指定时回退到摄像头 Id。</summary>
++        public string DisplayName =>
++            string.IsNullOrWhiteSpace(Descriptor?.DisplayName) ? Id : Descriptor.DisplayName;
++
++        /// <summary>声明的采集能力列表（可能为空）。</summary>
++        public IReadOnlyList<PluginCameraCapability> Capabilities =>
++            Descriptor?.Capabilities as IReadOnlyList<PluginCameraCapability>
++            ?? (IReadOnlyList<PluginCameraCapability>)Array.Empty<PluginCameraCapability>();
++
++        /// <summary>是否支持摄像头属性调节（当前宿主版本对插件摄像头不做属性映射）。</summary>
++        public bool SupportsPropertyControl => Descriptor?.SupportsPropertyControl == true;
++
++        /// <summary>拼装宿主内部唯一键。</summary>
++        public static string BuildKey(string providerId, string cameraId) =>
++            "plugin-camera://" + (providerId ?? "") + "/" + (cameraId ?? "");
++    }
++
++    /// <summary>
++    /// 插件摄像头提供者注册表（单例）。
++    /// <para>职责：</para>
++    /// <list type="bullet">
++    /// <item>保存插件注册的摄像头，供 <c>DirectShowCameraService.RefreshCameraListAsync</c>
++    /// 合并进视频展台下拉框；</item>
++    /// <item>作为 <see cref="IPluginCameraFrameSink"/> 接收插件推来的 BGR24 帧，
++    /// 维护"最近一帧"并通知订阅者；</item>
++    /// <item>管理当前唯一一路活动推流（启动 / 停止插件侧采集、调用 SetCameraFormat）。</item>
++    /// </list>
++    /// <para>设计取舍：只保留最近一帧、双缓冲交换，避免插件推帧时分配大数组；
++    /// 帧数据在锁内拷贝/读取，保证 UI 线程渲染与插件线程提交不会撕裂。</para>
++    /// </summary>
++    public sealed class CameraProviderRegistry : IPluginCameraFrameSink
++    {
++        /// <summary>全局单例。宿主各模块（摄像头服务、视频展台、插件服务）共用同一实例。</summary>
++        public static CameraProviderRegistry Instance { get; } = new CameraProviderRegistry();
++
++        private readonly object _listLock = new object();
++        private readonly object _frameLock = new object();
++        private readonly List<ProviderCameraRegistration> _registrations = new List<ProviderCameraRegistration>();
++
++        // 当前活动推流（同一时刻最多一路）
++        private ProviderCameraRegistration _activeCamera;
++        private bool _activeStarted;
++
++        // 最近一帧（双缓冲：Submit 写 _frameBackBuffer，交换后 _frameFrontBuffer 供读取）
++        private byte[] _frameFrontBuffer;
++        private byte[] _frameBackBuffer;
++        private int _frameWidth;
++        private int _frameHeight;
++        private int _frameStride;
++        private long _frameTimestampMs;
++        private long _frameSequence;
++
++        /// <summary>摄像头列表发生变化（注册/注销/插件通知）时触发。可能在任意线程触发，UI 使用需自行切线程。</summary>
++        public event EventHandler CamerasChanged;
++
++        /// <summary>收到一帧时触发（在插件推帧线程上同步触发，回调必须快速返回，不要在这里做渲染）。</summary>
++        public event EventHandler FrameSubmitted;
++
++        /// <summary>已注册的摄像头快照（线程安全，返回副本）。</summary>
++        public IReadOnlyList<ProviderCameraRegistration> Cameras
++        {
++            get
++            {
++                lock (_listLock)
++                {
++                    return _registrations.ToArray();
++                }
++            }
++        }
++
++        /// <summary>当前正在推流的摄像头键；没有则为 null。</summary>
++        public string ActiveCameraKey
++        {
++            get
++            {
++                lock (_listLock)
++                {
++                    return _activeCamera?.Key;
++                }
++            }
++        }
++
++        /// <summary>按 (providerId, cameraId) 查找已注册摄像头；找不到返回 null。</summary>
++        public ProviderCameraRegistration Find(string providerId, string cameraId)
++        {
++            if (string.IsNullOrEmpty(providerId) || string.IsNullOrEmpty(cameraId)) return null;
++            lock (_listLock)
++            {
++                return _registrations.FirstOrDefault(r =>
++                    string.Equals(r.ProviderId, providerId, StringComparison.OrdinalIgnoreCase)
++                    && string.Equals(r.Id, cameraId, StringComparison.OrdinalIgnoreCase));
++            }
++        }
++
++        /// <summary>按内部键查找已注册摄像头；找不到返回 null。</summary>
++        public ProviderCameraRegistration FindByKey(string key)
++        {
++            if (string.IsNullOrEmpty(key)) return null;
++            lock (_listLock)
++            {
++                return _registrations.FirstOrDefault(r =>
++                    string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase));
++            }
++        }
++
++        /// <summary>
++        /// 注册/覆盖一个摄像头提供者：移除它此前声明的全部摄像头后，按 GetCameras()
++        /// 重新加入，并触发 <see cref="CamerasChanged"/>。
++        /// </summary>
++        public void Register(IPluginCameraProvider provider)
++        {
++            if (provider == null) throw new ArgumentNullException(nameof(provider));
++            string providerId = provider.ProviderId;
++            if (string.IsNullOrWhiteSpace(providerId))
++                throw new ArgumentException("IPluginCameraProvider.ProviderId 不能为空", nameof(provider));
++
++            IReadOnlyList<PluginCameraDescriptor> descriptors = null;
++            try
++            {
++                descriptors = provider.GetCameras();
++            }
++            catch (Exception ex)
++            {
++                LogHelper.WriteLogToFile(
++                    $"[CameraProvider] 读取提供者 {providerId} 的摄像头列表失败: {ex.Message}",
++                    LogHelper.LogType.Error);
++            }
++
++            lock (_listLock)
++            {
++                _registrations.RemoveAll(r =>
++                    string.Equals(r.ProviderId, providerId, StringComparison.OrdinalIgnoreCase));
++                if (descriptors != null)
++                {
++                    foreach (var descriptor in descriptors)
++                    {
++                        if (descriptor == null || string.IsNullOrWhiteSpace(descriptor.Id))
++                        {
++                            LogHelper.WriteLogToFile(
++                                $"[CameraProvider] 提供者 {providerId} 返回了缺少 Id 的摄像头描述，已忽略",
++                                LogHelper.LogType.Warning);
++                            continue;
++                        }
++                        _registrations.Add(new ProviderCameraRegistration(provider, descriptor));
++                    }
++                }
++            }
++
++            LogHelper.WriteLogToFile(
++                $"[CameraProvider] 注册提供者 {providerId}，摄像头数={descriptors?.Count ?? 0}",
++                LogHelper.LogType.Info);
++            RaiseCamerasChanged();
++        }
++
++        /// <summary>注销指定提供者：停止其活动推流并移除它声明的全部摄像头。</summary>
++        public void Unregister(IPluginCameraProvider provider)
++        {
++            if (provider == null) return;
++            UnregisterByProviderId(provider.ProviderId);
++        }
++
++        /// <summary>
++        /// 按提供者 Id 注销（宿主在插件卸载时按 manifest.Id 清理，避免插件不调用
++        /// <see cref="ICameraProviderService.UnregisterProvider"/> 造成残留）。
++        /// </summary>
++        public void UnregisterByProviderId(string providerId)
++        {
++            if (string.IsNullOrWhiteSpace(providerId)) return;
++
++            bool removed;
++            lock (_listLock)
++            {
++                removed = _registrations.RemoveAll(r =>
++                    string.Equals(r.ProviderId, providerId, StringComparison.OrdinalIgnoreCase)) > 0;
++                // 活动推流属于该提供者时一并停止（StopActiveCamera 内部会调用插件 StopCamera）
++                if (_activeCamera != null &&
++                    string.Equals(_activeCamera.ProviderId, providerId, StringComparison.OrdinalIgnoreCase))
++                {
++                    removed = true;
++                }
++            }
++
++            if (!removed) return;
++            StopActiveCamera();
++            LogHelper.WriteLogToFile(
++                $"[CameraProvider] 注销提供者 {providerId} 的全部摄像头",
++                LogHelper.LogType.Info);
++            RaiseCamerasChanged();
++        }
++
++        /// <summary>插件通知摄像头列表变化：重新从提供者收取列表并触发刷新。</summary>
++        public void NotifyCamerasChanged(IPluginCameraProvider provider)
++        {
++            if (provider == null) return;
++            Register(provider);
++        }
++
++        /// <summary>
++        /// 启动指定摄像头的推流。会先停止上一路活动推流。
++        /// 本方法会同步调用插件 <see cref="IPluginCameraProvider.StartCamera"/>，请勿在 UI 线程直接调用
++        /// （宿主内部用 Task.Run 包一层）。
++        /// </summary>
++        /// <param name="camera">已注册摄像头。</param>
++        /// <param name="width">期望宽度；&lt;=0 表示不指定。</param>
++        /// <param name="height">期望高度；&lt;=0 表示不指定。</param>
++        /// <param name="frameRate">期望帧率；&lt;=0 时按 30 传。</param>
++        /// <param name="error">失败原因（成功时为 null）。</param>
++        public bool TryStartCamera(ProviderCameraRegistration camera, int width, int height, int frameRate, out string error)
++        {
++            error = null;
++            if (camera == null)
++            {
++                error = "摄像头未注册或已被移除";
++                return false;
++            }
++
++            // 上一路先停干净（包括旧帧，避免切摄像头瞬间串台）
++            StopActiveCamera();
++
++            lock (_listLock)
++            {
++                _activeCamera = camera;
++                _activeStarted = false;
++            }
++
++            bool ok;
++            try
++            {
++                ok = camera.Provider.StartCamera(camera.Id, this);
++            }
++            catch (Exception ex)
++            {
++                ok = false;
++                error = ex.Message;
++                LogHelper.WriteLogToFile(
++                    $"[CameraProvider] 提供者 {camera.ProviderId} 启动摄像头 {camera.Id} 异常: {ex.Message}",
++                    LogHelper.LogType.Error);
++            }
++
++            if (!ok)
++            {
++                lock (_listLock)
++                {
++                    if (ReferenceEquals(_activeCamera, camera)) _activeCamera = null;
++                    _activeStarted = false;
++                }
++                if (string.IsNullOrEmpty(error)) error = "插件拒绝了该摄像头的启动请求";
++                return false;
++            }
++
++            lock (_listLock)
++            {
++                _activeStarted = true;
++            }
++
++            // 分辨率：先启动再通知格式，插件既可在启动时使用，也可在运行中即时切换
++            if (width > 0 && height > 0)
++            {
++                TryApplyCameraFormat(camera, width, height, frameRate);
++            }
++
++            LogHelper.WriteLogToFile(
++                $"[CameraProvider] 已启动插件摄像头 {camera.DisplayName}（{camera.Key}），请求格式={width}×{height}@{frameRate}",
++                LogHelper.LogType.Info);
++            return true;
++        }
++
++        /// <summary>向当前活动摄像头请求切换采集格式；未启动或不支持时返回 false。</summary>
++        public bool TryApplyCameraFormat(int width, int height, int frameRate)
++        {
++            ProviderCameraRegistration camera;
++            lock (_listLock)
++            {
++                camera = _activeStarted ? _activeCamera : null;
++            }
++            return TryApplyCameraFormat(camera, width, height, frameRate);
++        }
++
++        private bool TryApplyCameraFormat(ProviderCameraRegistration camera, int width, int height, int frameRate)
++        {
++            if (camera == null || width <= 0 || height <= 0) return false;
++            try
++            {
++                return camera.Provider.SetCameraFormat(camera.Id, width, height, frameRate > 0 ? frameRate : 30);
++            }
++            catch (Exception ex)
++            {
++                LogHelper.WriteLogToFile(
++                    $"[CameraProvider] 提供者 {camera.ProviderId} 切换摄像头 {camera.Id} 格式失败: {ex.Message}",
++                    LogHelper.LogType.Warning);
++                return false;
++            }
++        }
++
++        /// <summary>
++        /// 停止当前活动推流：清空最近帧、通知插件 StopCamera。
++        /// 幂等；没有活动推流时为空操作。
++        /// </summary>
++        public void StopActiveCamera()
++        {
++            ProviderCameraRegistration camera;
++            lock (_listLock)
++            {
++                camera = _activeCamera;
++                _activeCamera = null;
++                _activeStarted = false;
++            }
++
++            lock (_frameLock)
++            {
++                _frameFrontBuffer = null;
++                _frameBackBuffer = null;
++                _frameWidth = 0;
++                _frameHeight = 0;
++                _frameStride = 0;
++                _frameSequence = 0;
++            }
++
++            if (camera == null) return;
++
++            try
++            {
++                camera.Provider.StopCamera(camera.Id);
++            }
++            catch (Exception ex)
++            {
++                LogHelper.WriteLogToFile(
++                    $"[CameraProvider] 提供者 {camera.ProviderId} 停止摄像头 {camera.Id} 异常: {ex.Message}",
++                    LogHelper.LogType.Error);
++            }
++
++            LogHelper.WriteLogToFile(
++                $"[CameraProvider] 已停止插件摄像头 {camera.DisplayName}（{camera.Key}）",
++                LogHelper.LogType.Info);
++        }
++
++        private void RaiseCamerasChanged()
++        {
++            try
++            {
++                CamerasChanged?.Invoke(this, EventArgs.Empty);
++            }
++            catch (Exception ex)
++            {
++                LogHelper.WriteLogToFile(
++                    $"[CameraProvider] CamerasChanged 事件处理异常: {ex.Message}",
++                    LogHelper.LogType.Warning);
++            }
++        }
++
++        // ====================================================================
++        // IPluginCameraFrameSink：接收插件推来的帧
++        // ====================================================================
++
++        /// <inheritdoc/>
++        public bool IsActive
++        {
++            get
++            {
++                lock (_listLock)
++                {
++                    return _activeStarted && _activeCamera != null;
++                }
++            }
++        }
++
++        /// <inheritdoc/>
++        public bool Submit(byte[] bgr24Buffer, int width, int height, int stride, long timestampMs = 0L)
++        {
++            if (bgr24Buffer == null || width <= 0 || height <= 0) return false;
++            int minStride = width * 3;
++            if (stride < minStride) return false;
++            long needed = (long)stride * height;
++            if (bgr24Buffer.LongLength < needed) return false;
++
++            lock (_frameLock)
++            {
++                lock (_listLock)
++                {
++                    if (!_activeStarted || _activeCamera == null) return false;
++                }
++
++                if (_frameBackBuffer == null || _frameBackBuffer.Length < needed)
++                    _frameBackBuffer = new byte[(int)needed];
++
++                // 两个缓冲都按当前帧需要的长度使用：更长的旧缓冲只用前 needed 字节
++                Buffer.BlockCopy(bgr24Buffer, 0, _frameBackBuffer, 0, (int)needed);
++                var swap = _frameFrontBuffer;
++                _frameFrontBuffer = _frameBackBuffer;
++                _frameBackBuffer = swap;
++                _frameWidth = width;
++                _frameHeight = height;
++                _frameStride = stride;
++                _frameTimestampMs = timestampMs;
++                _frameSequence++;
++            }
++
++            try
++            {
++                FrameSubmitted?.Invoke(this, EventArgs.Empty);
++            }
++            catch (Exception ex)
++            {
++                LogHelper.WriteLogToFile(
++                    $"[CameraProvider] FrameSubmitted 事件处理异常: {ex.Message}",
++                    LogHelper.LogType.Warning);
++            }
++            return true;
++        }
++
++        // ====================================================================
++        // 帧读取（消费侧：视频展台 UI / 摄像头服务）
++        // ====================================================================
++
++        /// <summary>读取最近一帧的尺寸信息；没有可用帧时返回 false。</summary>
++        public bool TryGetLatestFrameInfo(out int width, out int height, out int stride, out long timestampMs)
++        {
++            lock (_frameLock)
++            {
++                width = _frameWidth;
++                height = _frameHeight;
++                stride = _frameStride;
++                timestampMs = _frameTimestampMs;
++                return _frameFrontBuffer != null && _frameWidth > 0 && _frameHeight > 0;
++            }
++        }
++
++        /// <summary>
++        /// 把最近一帧写入目标 <see cref="WriteableBitmap"/>（必须在创建该位图的 UI 线程调用）。
++        /// 尺寸或像素格式不匹配时返回 false。
++        /// </summary>
++        public bool RenderLatestFrame(WriteableBitmap target)
++        {
++            if (target == null) return false;
++            lock (_frameLock)
++            {
++                if (_frameFrontBuffer == null || _frameWidth <= 0 || _frameHeight <= 0) return false;
++                if (target.PixelWidth != _frameWidth || target.PixelHeight != _frameHeight) return false;
++                if (target.Format != PixelFormats.Bgr24) return false;
++                int needed = _frameStride * _frameHeight;
++                if (_frameFrontBuffer.Length < needed) return false;
++                target.WritePixels(
++                    new Int32Rect(0, 0, _frameWidth, _frameHeight),
++                    _frameFrontBuffer,
++                    _frameStride,
++                    0);
++                return true;
++            }
++        }
++
++        /// <summary>
++        /// 取最近一帧的冻结副本（用于拍照）。返回的位图可跨线程使用；没有可用帧时返回 null。
++        /// </summary>
++        public BitmapSource GetLatestFrameBitmapSource()
++        {
++            lock (_frameLock)
++            {
++                if (_frameFrontBuffer == null || _frameWidth <= 0 || _frameHeight <= 0) return null;
++                int needed = _frameStride * _frameHeight;
++                if (_frameFrontBuffer.Length < needed) return null;
++                try
++                {
++                    var bitmap = BitmapSource.Create(
++                        _frameWidth,
++                        _frameHeight,
++                        96,
++                        96,
++                        PixelFormats.Bgr24,
++                        null,
++                        _frameFrontBuffer,
++                        _frameStride);
++                    bitmap.Freeze();
++                    return bitmap;
++                }
++                catch (Exception ex)
++                {
++                    LogHelper.WriteLogToFile(
++                        $"[CameraProvider] 取最近帧失败: {ex.Message}",
++                        LogHelper.LogType.Warning);
++                    return null;
++                }
++            }
++        }
++
++        /// <summary>把最近一帧复制为独立的 BGR24 缓冲区（用于非 WPF 调用方）。</summary>
++        public bool TryCopyLatestFrame(out byte[] buffer, out int width, out int height, out int stride)
++        {
++            buffer = null;
++            lock (_frameLock)
++            {
++                width = _frameWidth;
++                height = _frameHeight;
++                stride = _frameStride;
++                if (_frameFrontBuffer == null || _frameWidth <= 0 || _frameHeight <= 0) return false;
++                int needed = _frameStride * _frameHeight;
++                if (_frameFrontBuffer.Length < needed) return false;
++                var copy = new byte[needed];
++                Buffer.BlockCopy(_frameFrontBuffer, 0, copy, 0, needed);
++                buffer = copy;
++                return true;
++            }
++        }
++
++        /// <summary>最近一帧的序号（每次成功 Submit 自增，可用于诊断帧率）。</summary>
++        public long FrameSequence
++        {
++            get
++            {
++                lock (_frameLock)
++                {
++                    return _frameSequence;
++                }
++            }
++        }
++    }
++}
+diff --git a/Ink Canvas/Helpers/DirectShowCameraService.cs b/Ink Canvas/Helpers/DirectShowCameraService.cs
+index 93b5b916..ae68542c 100644
+--- a/Ink Canvas/Helpers/DirectShowCameraService.cs	
++++ b/Ink Canvas/Helpers/DirectShowCameraService.cs	
+@@ -61,6 +61,11 @@ namespace Ink_Canvas.Helpers
+         private readonly List<ResolutionInfo> _nativeResolutions = new List<ResolutionInfo>();
+         private int _selectedResolutionIndex = -1;
+ 
++        // 插件摄像头提供者（camera provider）预览标记：
++        // true 表示当前预览由 CameraProviderRegistry 供帧（非 DirectShow），
++        // StopPreview 时需要取消 FrameSubmitted 订阅并让插件停止推流。
++        private bool _isProviderPreview;
++
+         // === 复用缓冲区：避免每帧新建 BitmapSource 触发 WPF DUCE 纹理堆积 OOM ===
+         // 复用的 WriteableBitmap（UI 线程访问，通过 WritePixels 更新内容；Image.Source 持续指向它，
+         // WPF 合成器通过 AddDirtyRect 自动重绘，不再每帧重新分配 GPU 纹理）
+@@ -163,6 +168,16 @@ namespace Ink_Canvas.Helpers
+                         return;
+                     }
+ 
++                    // 插件摄像头没有 DirectShow filter，读取不到 IAMVideoProcAmp/IAMCameraControl；
++                    // 保持全部属性为"不支持"，展台属性滑块自动置灰（与不支持的 USB 摄像头一致）。
++                    if (CurrentCamera.IsProviderCamera)
++                    {
++                        LogHelper.WriteLogToFile(
++                            $"[CameraProvider] ProbeCameraProperties: 插件摄像头 {CurrentCamera.Name} 不支持 DirectShow 属性调节，属性滑块保持禁用",
++                            LogHelper.LogType.Info);
++                        return;
++                    }
++
+                     // 通过 MonikerString/Name 重新枚举 DsDevice，拿到 IMoniker 用于 AddSourceFilterForMoniker
+                     var devices = DsDevice.GetDevicesOfCat(FilterCategory.VideoInputDevice);
+                     DsDevice target = null;
+@@ -607,6 +622,8 @@ namespace Ink_Canvas.Helpers
+             try
+             {
+                 _cameras.Clear();
++                // 摄像头列表重建后插件能力缓存失效，下次 Enumerate 重新填充
++                _providerResolutionsCameraKey = null;
+                 var devices = DsDevice.GetDevicesOfCat(FilterCategory.VideoInputDevice);
+                 foreach (var dev in devices)
+                 {
+@@ -619,8 +636,32 @@ namespace Ink_Canvas.Helpers
+                     });
+                 }
+ 
++                // 合并插件摄像头提供者（camera provider）注册的虚拟摄像头：
++                // 与 DirectShow 设备并列出现在视频展台下拉框里，但预览/拍照走非 DirectShow 路径
++                // （见 MainWindow.VideoPresenterProviderImage 与 CameraProviderRegistry）。
++                try
++                {
++                    foreach (var registration in CameraProviderRegistry.Instance.Cameras)
++                    {
++                        _cameras.Add(new CameraInfo
++                        {
++                            Name = registration.DisplayName,
++                            MonikerString = registration.Key,
++                            IsProviderCamera = true,
++                            ProviderId = registration.ProviderId,
++                            ProviderCameraId = registration.Id,
++                        });
++                    }
++                }
++                catch (Exception ex)
++                {
++                    LogHelper.WriteLogToFile(
++                        $"[CameraProvider] 合并插件摄像头列表失败: {ex.Message}",
++                        LogHelper.LogType.Warning);
++                }
++
+                 LogHelper.WriteLogToFile(
+-                    $"[DirectShow] RefreshCameraList 完成，共 {_cameras.Count} 个摄像头",
++                    $"[DirectShow] RefreshCameraList 完成，共 {_cameras.Count} 个摄像头（DirectShow {_cameras.Count(c => !c.IsProviderCamera)} + 插件 {_cameras.Count(c => c.IsProviderCamera)}）",
+                     LogHelper.LogType.Info);
+             }
+             catch (Exception ex)
+@@ -661,6 +702,14 @@ namespace Ink_Canvas.Helpers
+ 
+                 CurrentCamera = _cameras[cameraIndex];
+ 
++                // 插件摄像头：不构建 DirectShow 图，改为让插件推帧、由本服务转发 FrameReceived。
++                // 视频展台特殊模式另有更轻的渲染路径（MainWindow.VideoPresenterProviderImage），
++                // 本分支主要用于 ScreenshotSelectorWindow / 旧"上屏"等使用 ICameraService 的场景。
++                if (CurrentCamera.IsProviderCamera)
++                {
++                    return StartProviderPreviewCore();
++                }
++
+                 // === 构建 FilterGraph: source -> sample grabber -> null renderer ===
+                 _filterGraph = (IFilterGraph2)new FilterGraph();
+ 
+@@ -733,6 +782,203 @@ namespace Ink_Canvas.Helpers
+             }
+         }
+ 
++        /// <summary>
++        /// 插件摄像头（camera provider）的预览启动：不构建 DirectShow 图，
++        /// 改为订阅 <see cref="CameraProviderRegistry.FrameSubmitted"/>，把插件推来的帧转成
++        /// <see cref="FrameReceived"/> 事件（供 ScreenshotSelectorWindow / 旧"上屏"路径使用）。
++        /// </summary>
++        private bool StartProviderPreviewCore()
++        {
++            try
++            {
++                var registry = CameraProviderRegistry.Instance;
++                StopProviderPreviewCore();
++
++                // 确保分辨率列表/选中项就绪（非特殊模式没有 EnumerateResolutionsAsync 前置调用）
++                FillProviderCameraResolutions(CurrentCamera);
++
++                var registration = registry.Find(CurrentCamera.ProviderId, CurrentCamera.ProviderCameraId);
++                if (registration == null)
++                {
++                    ErrorOccurred?.Invoke(this, $"插件摄像头不可用: {CurrentCamera.Name}");
++                    return false;
++                }
++
++                // 订阅必须在启动之前：插件可能在 StartCamera 内同步推第一帧
++                registry.FrameSubmitted += OnProviderCameraFrameSubmitted;
++                _isProviderPreview = true;
++
++                int width = 0, height = 0, frameRate = 0;
++                if (_selectedResolutionIndex >= 0 && _selectedResolutionIndex < _nativeResolutions.Count)
++                {
++                    var cap = _nativeResolutions[_selectedResolutionIndex];
++                    width = cap.Width;
++                    height = cap.Height;
++                    frameRate = cap.FrameRate;
++                }
++
++                if (!registry.TryStartCamera(registration, width, height, frameRate, out string error))
++                {
++                    StopProviderPreviewCore();
++                    ErrorOccurred?.Invoke(this, $"启动插件摄像头失败: {error}");
++                    return false;
++                }
++
++                _isCapturing = true;
++                LogHelper.WriteLogToFile(
++                    $"[CameraProvider] StartPreview 成功: {CurrentCamera.Name}，请求格式={width}×{height}@{frameRate}，能力数={_nativeResolutions.Count}",
++                    LogHelper.LogType.Info);
++                return true;
++            }
++            catch (Exception ex)
++            {
++                StopProviderPreviewCore();
++                LogHelper.WriteLogToFile($"[CameraProvider] 启动插件摄像头预览失败: {ex.Message}", LogHelper.LogType.Error);
++                ErrorOccurred?.Invoke(this, $"启动插件摄像头预览失败: {ex.Message}");
++                return false;
++            }
++        }
++
++        /// <summary>停止插件摄像头预览（幂等）：取消帧订阅并让插件停止推流。</summary>
++        private void StopProviderPreviewCore()
++        {
++            if (!_isProviderPreview) return;
++            _isProviderPreview = false;
++            _isCapturing = false;
++            try
++            {
++                CameraProviderRegistry.Instance.FrameSubmitted -= OnProviderCameraFrameSubmitted;
++            }
++            catch (Exception ex)
++            {
++                LogHelper.WriteLogToFile($"[CameraProvider] 取消帧订阅失败: {ex.Message}", LogHelper.LogType.Info);
++            }
++            try
++            {
++                CameraProviderRegistry.Instance.StopActiveCamera();
++            }
++            catch (Exception ex)
++            {
++                LogHelper.WriteLogToFile($"[CameraProvider] 停止插件推流失败: {ex.Message}", LogHelper.LogType.Warning);
++            }
++        }
++
++        /// <summary>插件推帧线程回调：转成宿主 <see cref="FrameReceived"/> 事件。</summary>
++        private void OnProviderCameraFrameSubmitted(object sender, EventArgs e)
++        {
++            if (!_isProviderPreview) return;
++            try
++            {
++                var frame = CameraProviderRegistry.Instance.GetLatestFrameBitmapSource();
++                if (frame != null) FrameReceived?.Invoke(this, new FrameEventArgs { Frame = frame });
++            }
++            catch (Exception ex)
++            {
++                LogHelper.WriteLogToFile($"[CameraProvider] 转发插件摄像头帧失败: {ex.Message}", LogHelper.LogType.Warning);
++            }
++        }
++
++        /// <summary>
++        /// 插件摄像头能力填充的"调用线程内联"入口：命中时同步填充并返回 true。
++        /// <see cref="EnumerateResolutionsAsync"/> 用它避免后台线程与 UI 线程同时访问分辨率列表。
++        /// </summary>
++        private bool TryEnumerateProviderResolutionsInline(int cameraIndex)
++        {
++            try
++            {
++                if (_cameras.Count == 0)
++                {
++                    RefreshCameraListAsync().GetAwaiter().GetResult();
++                }
++                if (cameraIndex < 0 || cameraIndex >= _cameras.Count) return false;
++                var camera = _cameras[cameraIndex];
++                if (camera == null || !camera.IsProviderCamera) return false;
++
++                // 与 DirectShow 分支一致：即使没有真正启动预览，也记录当前选择
++                CurrentCamera = camera;
++                FillProviderCameraResolutions(camera);
++                return true;
++            }
++            catch (Exception ex)
++            {
++                LogHelper.WriteLogToFile(
++                    $"[CameraProvider] 枚举插件摄像头分辨率失败: {ex.Message}",
++                    LogHelper.LogType.Error);
++                return false;
++            }
++        }
++
++        /// <summary>
++        /// 用插件声明的能力列表填充 _nativeResolutions / _selectedResolutionIndex /
++        /// UniqueResolutions / AllResolutionFpsCombos 及派生索引。
++        /// 默认选中项与 DirectShow 路径一致：与 1920×1080 曼哈顿距离最小的能力组合。
++        /// 同一摄像头的列表已填充过时直接返回（避免重复修改供 UI 遍历的列表）。
++        /// </summary>
++        private void FillProviderCameraResolutions(CameraInfo camera)
++        {
++            string cameraKey = camera == null
++                ? null
++                : ProviderCameraRegistration.BuildKey(camera.ProviderId, camera.ProviderCameraId);
++
++            if (cameraKey != null
++                && _nativeResolutions.Count > 0
++                && string.Equals(cameraKey, _providerResolutionsCameraKey, StringComparison.OrdinalIgnoreCase))
++            {
++                return;
++            }
++            _providerResolutionsCameraKey = cameraKey;
++
++            _nativeResolutions.Clear();
++            _selectedResolutionIndex = -1;
++
++            var registration = camera == null
++                ? null
++                : CameraProviderRegistry.Instance.Find(camera.ProviderId, camera.ProviderCameraId);
++            if (registration == null)
++            {
++                RebuildUniqueResolutions();
++                SyncDerivedIndicesFromCapability();
++                return;
++            }
++
++            const int preferredW = 1920;
++            const int preferredH = 1080;
++            int bestIndex = -1;
++            int bestDiff = int.MaxValue;
++            var seen = new HashSet<string>();
++
++            foreach (var capability in registration.Capabilities)
++            {
++                if (capability == null || capability.Width <= 0 || capability.Height <= 0) continue;
++                int fps = capability.FrameRate > 0 ? capability.FrameRate : 30;
++                if (!seen.Add($"{capability.Width}x{capability.Height}x{fps}")) continue;
++
++                _nativeResolutions.Add(new ResolutionInfo
++                {
++                    Width = capability.Width,
++                    Height = capability.Height,
++                    FrameRate = fps,
++                });
++
++                int diff = Math.Abs(capability.Width - preferredW) + Math.Abs(capability.Height - preferredH);
++                if (diff < bestDiff)
++                {
++                    bestDiff = diff;
++                    bestIndex = _nativeResolutions.Count - 1;
++                }
++            }
++
++            if (bestIndex >= 0) _selectedResolutionIndex = bestIndex;
++            else if (_nativeResolutions.Count > 0) _selectedResolutionIndex = 0;
++
++            RebuildUniqueResolutions();
++            SyncDerivedIndicesFromCapability();
++
++            LogHelper.WriteLogToFile(
++                $"[CameraProvider] 枚举插件摄像头能力: {registration.DisplayName}，能力数={_nativeResolutions.Count}，选中={_selectedResolutionIndex}",
++                LogHelper.LogType.Info);
++        }
++
+         private IBaseFilter CreateSourceFilterByDevicePath(string devicePath)
+         {
+             var devices = DsDevice.GetDevicesOfCat(FilterCategory.VideoInputDevice);
+@@ -781,6 +1027,8 @@ namespace Ink_Canvas.Helpers
+         /// </summary>
+         private void EnumerateCapabilitiesFromConfig(IAMStreamConfig config)
+         {
++            // 切到 DirectShow 摄像头后，插件摄像头的能力缓存失效（下次切回需要重新填充）
++            _providerResolutionsCameraKey = null;
+             _nativeResolutions.Clear();
+             _selectedResolutionIndex = -1;
+ 
+@@ -937,6 +1185,9 @@ namespace Ink_Canvas.Helpers
+             SyncDerivedIndicesFromCapability();
+         }
+ 
++        // 插件摄像头能力列表当前对应的摄像头键；用于避免重复重建（见 FillProviderCameraResolutions）
++        private string _providerResolutionsCameraKey;
++
+         /// <summary>
+         /// 独立枚举指定摄像头的 native 分辨率（不启动预览，不抢占设备）。
+         /// 参考 EasiCamera Cvte.MediaDevice.VideoInputService.GetAllAvailableResolution：
+@@ -949,6 +1200,15 @@ namespace Ink_Canvas.Helpers
+         /// </summary>
+         public Task EnumerateResolutionsAsync(int cameraIndex)
+         {
++            // 插件摄像头（camera provider）：能力来自内存注册表，不需要建 DirectShow 图。
++            // 直接在调用线程（宿主为 UI 线程）填充，避免后台线程改 _nativeResolutions /
++            // AllResolutionFpsCombos 的同时 UI 线程 RefreshBoothResolutionComboBox 正在遍历
++            // 它们而抛 "Collection was modified; enumeration operation may not execute"。
++            if (TryEnumerateProviderResolutionsInline(cameraIndex))
++            {
++                return Task.CompletedTask;
++            }
++
+             return Task.Run(() =>
+             {
+                 try
+@@ -973,6 +1233,13 @@ namespace Ink_Canvas.Helpers
+                     // MainWindow.FindCurrentCameraIndex 依赖此字段）
+                     CurrentCamera = _cameras[cameraIndex];
+ 
++                    // 插件摄像头：能力列表由插件声明，不走 DirectShow 枚举
++                    if (CurrentCamera.IsProviderCamera)
++                    {
++                        FillProviderCameraResolutions(CurrentCamera);
++                        return;
++                    }
++
+                     // 通过 _cameras 中保存的 MonikerString 重新枚举 DsDevice，
+                     // 以便 AddSourceFilterForMoniker 拿到正确的 IMoniker
+                     var devices = DsDevice.GetDevicesOfCat(FilterCategory.VideoInputDevice);
+@@ -1292,6 +1559,9 @@ namespace Ink_Canvas.Helpers
+         {
+             try
+             {
++                // 插件摄像头预览：取消订阅并让插件停止推流（没有 DirectShow 图可清理）
++                StopProviderPreviewCore();
++
+                 if (_mediaControl != null)
+                 {
+                     try { _mediaControl.Stop(); }
+@@ -1315,6 +1585,9 @@ namespace Ink_Canvas.Helpers
+         {
+             try
+             {
++                // 插件摄像头预览：先取消订阅并让插件停止推流（没有 DirectShow 图可清理）
++                StopProviderPreviewCore();
++
+                 // 先标记停止，让 BufferCB 立即短路返回，避免访问正在被释放的 COM 对象
+                 _isCapturing = false;
+ 
+@@ -1645,6 +1918,13 @@ namespace Ink_Canvas.Helpers
+         /// <summary>获取当前帧的 WPF 位图（已 Freeze，可跨线程）。</summary>
+         public BitmapSource GetCurrentFrameAsBitmapSource()
+         {
++            // 插件摄像头：帧由 CameraProviderRegistry 缓存，直接从最近一帧生成 BitmapSource
++            if (_isProviderPreview)
++            {
++                try { return CameraProviderRegistry.Instance.GetLatestFrameBitmapSource(); }
++                catch { return null; }
++            }
++
+             lock (_frameLock)
+             {
+                 if (_currentFrame == null) return null;
+@@ -1662,6 +1942,12 @@ namespace Ink_Canvas.Helpers
+         /// <summary>获取当前帧的 GDI+ Bitmap 副本（调用方负责 Dispose）。</summary>
+         public Bitmap GetCurrentFrameAsBitmap()
+         {
++            // 插件摄像头：把最近一帧 BGR24 缓冲拷进 GDI+ Bitmap
++            if (_isProviderPreview)
++            {
++                return BuildProviderFrameBitmap();
++            }
++
+             lock (_frameLock)
+             {
+                 if (_currentFrame == null) return null;
+@@ -1676,6 +1962,47 @@ namespace Ink_Canvas.Helpers
+             }
+         }
+ 
++        /// <summary>把插件摄像头最近一帧复制成 System.Drawing.Bitmap（调用方负责 Dispose）。</summary>
++        private Bitmap BuildProviderFrameBitmap()
++        {
++            try
++            {
++                if (!CameraProviderRegistry.Instance.TryCopyLatestFrame(
++                        out byte[] buffer, out int width, out int height, out int stride))
++                {
++                    return null;
++                }
++                var bitmap = new Bitmap(width, height, PixelFormat.Format24bppRgb);
++                var bitmapData = bitmap.LockBits(
++                    new Rectangle(0, 0, width, height),
++                    ImageLockMode.WriteOnly,
++                    PixelFormat.Format24bppRgb);
++                try
++                {
++                    int copyHeight = Math.Min(height, bitmapData.Height);
++                    int copyStride = Math.Min(stride, bitmapData.Stride);
++                    for (int y = 0; y < copyHeight; y++)
++                    {
++                        Marshal.Copy(
++                            buffer,
++                            y * stride,
++                            IntPtr.Add(bitmapData.Scan0, y * bitmapData.Stride),
++                            copyStride);
++                    }
++                }
++                finally
++                {
++                    bitmap.UnlockBits(bitmapData);
++                }
++                return bitmap;
++            }
++            catch (Exception ex)
++            {
++                LogHelper.WriteLogToFile($"[CameraProvider] 插件帧转 Bitmap 失败: {ex.Message}", LogHelper.LogType.Warning);
++                return null;
++            }
++        }
++
+         private static BitmapSource BitmapToBitmapSource(Bitmap bmp)
+         {
+             if (bmp == null || bmp.Width <= 0 || bmp.Height <= 0) return null;
+diff --git a/Ink Canvas/Helpers/ICameraService.cs b/Ink Canvas/Helpers/ICameraService.cs
+index 704aa3ac..fc0437fa 100644
+--- a/Ink Canvas/Helpers/ICameraService.cs	
++++ b/Ink Canvas/Helpers/ICameraService.cs	
+@@ -206,6 +206,19 @@ namespace Ink_Canvas.Helpers
+     {
+         public string Name { get; set; }
+         public string MonikerString { get; set; }
++
++        /// <summary>
++        /// 是否为插件摄像头提供者（camera provider）注册的虚拟摄像头。
++        /// 这类摄像头不经过 DirectShow：预览走 MainWindow 的 WPF Image 路径，
++        /// 拍照取宿主缓存的最近一帧，分辨率来自插件声明的能力列表。
++        /// </summary>
++        public bool IsProviderCamera { get; set; }
++
++        /// <summary>插件摄像头提供者 Id（<see cref="Ink_Canvas.Plugins.IPluginCameraProvider.ProviderId"/>）。</summary>
++        public string ProviderId { get; set; }
++
++        /// <summary>提供者内该摄像头的 Id（<see cref="Ink_Canvas.Plugins.PluginCameraDescriptor.Id"/>）。</summary>
++        public string ProviderCameraId { get; set; }
+     }
+ 
+     public class ResolutionInfo
+diff --git a/Ink Canvas/MainWindow.xaml b/Ink Canvas/MainWindow.xaml
+index f59fdd7a..3d85315b 100644
+--- a/Ink Canvas/MainWindow.xaml	
++++ b/Ink Canvas/MainWindow.xaml	
+@@ -188,6 +188,15 @@
+                             </TransformGroup>
+                         </helpers:CapturableVideoCaptureElement.RenderTransform>
+                     </helpers:CapturableVideoCaptureElement>
++                    <!-- 插件摄像头（camera provider）预览：非 DirectShow 路径。
++                         插件通过 IPluginCameraFrameSink 推 BGR24 帧，宿主在这里用 WPF Image 渲染。
++                         代码里（PrepareProviderImageView）会把它的 LayoutTransform/RenderTransform
++                         指向 VideoCaptureElement 的同名实例，因此缩放/旋转/镜像/批注与 DirectShow
++                         预览走完全相同的变换管线；同一时刻只会显示两者之一。 -->
++                    <Image x:Name="VideoPresenterProviderImage"
++                           Stretch="Uniform"
++                           RenderTransformOrigin="0,0"
++                           Visibility="Collapsed" />
+                     <!-- 拍照后冻结画面：覆盖在 VideoCaptureElement 之上，显示拍照的照片，
+                          让用户在照片上批注。用 FillImage（重写 MeasureOverride 返回 availableSize）
+                          让照片像 VideoCaptureElement 一样填满容器，使 LayoutTransform 旋转、
+diff --git a/Ink Canvas/MainWindow_cs/MW_VideoPresenter.cs b/Ink Canvas/MainWindow_cs/MW_VideoPresenter.cs
+index b599eec5..f4f6b654 100644
+--- a/Ink Canvas/MainWindow_cs/MW_VideoPresenter.cs	
++++ b/Ink Canvas/MainWindow_cs/MW_VideoPresenter.cs	
+@@ -38,6 +38,17 @@ namespace Ink_Canvas
+         private readonly object _videoPresenterFrameLock = new object();
+         private Bitmap _lastFrame;
+ 
++        // === 插件摄像头（camera provider）预览状态 ===
++        // 插件摄像头不经过 DirectShow：由插件通过 IPluginCameraFrameSink 推 BGR24 帧，
++        // 宿主在 VideoPresenterProviderImage 上渲染（与 VideoCaptureElement 共享变换实例），
++        // 拍照直接取 CameraProviderRegistry 缓存的最近一帧。
++        private bool _boothProviderCameraActive;
++        private WriteableBitmap _boothProviderWriteableBitmap;
++        // 帧到达通知合并标志：插件推帧频率可能高于 UI 渲染，已有一次渲染排队时丢弃后续通知
++        private bool _boothProviderFrameRenderPending;
++        // 是否已订阅 CameraProviderRegistry.CamerasChanged（避免重复订阅/重复刷新）
++        private bool _cameraProviderListChangedHooked;
++
+         // 视频展台特殊模式：开启后整个白板进入深色背景模式，预览铺满画布
+         private bool _isVideoPresenterSpecialMode;
+         // 视频展台虚拟分页：当前所在的页。-1=直播页，0..N-1=_capturedPhotos 中的照片索引
+@@ -1132,6 +1143,9 @@ namespace Ink_Canvas
+             // 左上角侧栏预览已移除（VideoPresenterPreviewImage 已从 XAML 删除），
+             // 不再需要清理 Image.Source。clearPreviewImage 参数保留用于调用方语义兼容。
+ 
++            // 插件摄像头：停止插件侧推流并清空画面（非 DirectShow 路径）
++            StopBoothProviderCamera();
++
+             try { VideoPresenterFullCanvasImage?.Stop(); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine(ex); }
+             try { _cameraService?.StopPreview(); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine(ex); }
+             lock (_videoPresenterFrameLock)
+@@ -1154,6 +1168,20 @@ namespace Ink_Canvas
+             // 恢复上次退出时保存的展台旋转角度（0..3），使预览/拍照方向与应用保持一致
+             _cameraService.RotationAngle = NormalizeBoothRotationAngle(Settings?.Canvas?.VideoPresenterRotationAngle ?? 0);
+             SyncBoothResolutionToCameraService();
++
++            // 订阅插件摄像头列表变化：插件在展台打开期间注册/注销/增删虚拟摄像头时即时刷新下拉框
++            if (!_cameraProviderListChangedHooked)
++            {
++                try
++                {
++                    CameraProviderRegistry.Instance.CamerasChanged += CameraProviderRegistry_CamerasChanged;
++                    _cameraProviderListChangedHooked = true;
++                }
++                catch (Exception ex)
++                {
++                    LogHelper.WriteLogToFile($"[CameraProvider] 订阅摄像头列表变化失败: {ex.Message}", LogHelper.LogType.Warning);
++                }
++            }
+         }
+ 
+         internal void SyncBoothResolutionToCameraService()
+@@ -2187,19 +2215,28 @@ namespace Ink_Canvas
+ 
+                 if (_isVideoPresenterSpecialMode)
+                 {
+-                    // 特殊模式：直接启动 VideoCaptureElement（DirectShow + VMR9 + D3DImage 零拷贝）
+-                    bool ok = await StartVideoCaptureElementPreviewAsync(cameraIndex);
++                    // 特殊模式：DirectShow 摄像头走 VideoCaptureElement（VMR9 + D3DImage 零拷贝）；
++                    // 插件摄像头（camera provider）走非 DirectShow 路径（WPF Image + 插件推帧）。
++                    bool ok;
++                    if (IsProviderCameraIndex(cameraIndex))
++                    {
++                        ok = await StartProviderCameraPreviewAsync(cameraIndex);
++                    }
++                    else
++                    {
++                        ok = await StartVideoCaptureElementPreviewAsync(cameraIndex);
++                    }
+                     if (ok)
+                     {
+                         // 不在此处启用拍照按钮 —— Play() 返回 true 不代表 D3DImage 已分配表面，
+-                        // 此时 CopyBackBuffer 仍可能返回 null。改为在 MediaOpened 事件中启用按钮
+-                        // （VideoPresenterFullCanvasImage_MediaOpened 已实现）。
++                        // 此时 CopyBackBuffer 仍可能返回 null。改为在 MediaOpened / 插件首帧事件中启用按钮
++                        // （VideoPresenterFullCanvasImage_MediaOpened 与 RenderBoothProviderFrame 已实现）。
+                         RefreshBoothResolutionComboBox();
+                     }
+                     else
+                     {
+                         LogHelper.WriteLogToFile(
+-                            "StartVideoPresenterPreview: VideoCaptureElement 启动失败",
++                            $"StartVideoPresenterPreview: 预览启动失败（插件摄像头={IsProviderCameraIndex(cameraIndex)}）",
+                             LogHelper.LogType.Warning);
+                     }
+                 }
+@@ -2225,12 +2262,355 @@ namespace Ink_Canvas
+             }
+         }
+ 
++        /// <summary>当前摄像头索引是否为插件摄像头（camera provider，非 DirectShow）。</summary>
++        private bool IsProviderCameraIndex(int cameraIndex)
++        {
++            var cameras = _cameraService?.AvailableCameras;
++            return cameras != null
++                && cameraIndex >= 0
++                && cameraIndex < cameras.Count
++                && cameras[cameraIndex] != null
++                && cameras[cameraIndex].IsProviderCamera;
++        }
++
++        /// <summary>
++        /// 启动插件摄像头（camera provider）预览。非 DirectShow 路径：
++        /// 插件通过 <see cref="Ink_Canvas.Plugins.IPluginCameraFrameSink"/> 推 BGR24 帧，
++        /// 宿主在 VideoPresenterProviderImage 上渲染（与 VideoCaptureElement 共享变换实例），
++        /// 拍照取 CameraProviderRegistry 缓存的最近一帧。
++        /// 返回是否成功启动（首帧是否到达由 RenderBoothProviderFrame 处理）。
++        /// </summary>
++        private async Task<bool> StartProviderCameraPreviewAsync(int cameraIndex)
++        {
++            try
++            {
++                if (VideoPresenterProviderImage == null)
++                {
++                    LogHelper.WriteLogToFile(
++                        "[VideoPresenter] StartProviderCameraPreviewAsync: VideoPresenterProviderImage 为 null",
++                        LogHelper.LogType.Warning);
++                    return false;
++                }
++                if (!IsProviderCameraIndex(cameraIndex))
++                {
++                    return false;
++                }
++
++                var camera = _cameraService.AvailableCameras[cameraIndex];
++                var registry = CameraProviderRegistry.Instance;
++                var registration = registry.Find(camera.ProviderId, camera.ProviderCameraId);
++                if (registration == null)
++                {
++                    LogHelper.WriteLogToFile(
++                        $"[VideoPresenter] StartProviderCameraPreviewAsync: 插件摄像头未注册 {camera.Name}（{camera.MonikerString}）",
++                        LogHelper.LogType.Warning);
++                    if (VideoPresenterSearchingText != null)
++                    {
++                        VideoPresenterSearchingText.Text = "插件摄像头不可用";
++                        VideoPresenterSearchingText.Visibility = Visibility.Visible;
++                    }
++                    return false;
++                }
++
++                // 1) 停掉 DirectShow 预览（若正在播放），避免两路画面叠加
++                try { VideoPresenterFullCanvasImage?.Stop(); }
++                catch (Exception ex)
++                {
++                    LogHelper.WriteLogToFile($"[VideoPresenter] 启动插件摄像头前停止 DirectShow 预览失败: {ex.Message}", LogHelper.LogType.Info);
++                }
++                try { VideoPresenterFullCanvasImage.VideoCaptureDevice = null; }
++                catch (Exception ex)
++                {
++                    LogHelper.WriteLogToFile($"[VideoPresenter] 启动插件摄像头前释放 DirectShow 设备失败: {ex.Message}", LogHelper.LogType.Info);
++                }
++                if (VideoPresenterFullCanvasImage != null)
++                {
++                    VideoPresenterFullCanvasImage.Visibility = Visibility.Collapsed;
++                }
++
++                // 2) 准备插件画面 Image：共享 VideoCaptureElement 的变换实例，保证缩放/旋转/镜像/批注一致
++                //    注意：必须先停掉上一路插件推流（StopBoothProviderCamera 会把 Image 复位为 Collapsed），
++                //    再让它可见，否则画面会渲染到一个 Collapsed 的 Image 上（用户看不到预览）。
++                StopBoothProviderCamera();
++                PrepareProviderImageView();
++                if (VideoPresenterFullCanvasRotation != null && _cameraService != null)
++                {
++                    VideoPresenterFullCanvasRotation.Angle = _cameraService.RotationAngle * 90.0;
++                }
++                ApplyBoothPreviewTransform();
++
++                // 3) 清掉其它路径的拍照缓存：插件摄像头拍照改走最近帧
++                lock (_videoPresenterFrameLock)
++                {
++                    _lastFrame?.Dispose();
++                    _lastFrame = null;
++                }
++
++                // 4) 目标分辨率：分辨率下拉框当前选中的能力项（也是 EnumerateResolutionsAsync 的默认项）
++                int width = 0, height = 0, frameRate = 0;
++                int selIdx = _cameraService.SelectedResolutionIndex;
++                var resolutions = _cameraService.NativeResolutions;
++                if (selIdx >= 0 && selIdx < (resolutions?.Count ?? 0))
++                {
++                    var resolution = resolutions[selIdx];
++                    width = resolution.Width;
++                    height = resolution.Height;
++                    frameRate = resolution.FrameRate;
++                }
++
++                // 5) 订阅必须在 StartCamera 之前：插件可能在 StartCamera 内部就同步推出第一帧
++                registry.FrameSubmitted += CameraProviderRegistry_FrameSubmitted;
++                _boothProviderCameraActive = true;
++                _boothProviderFrameRenderPending = false;
++
++                if (VideoPresenterSearchingText != null)
++                {
++                    VideoPresenterSearchingText.Text = "正在启动摄像头...";
++                    VideoPresenterSearchingText.Visibility = Visibility.Visible;
++                }
++                if (BtnCapturePhoto != null) BtnCapturePhoto.IsEnabled = false;
++
++                // 插件 StartCamera 可能同步做网络连接，放到后台线程避免卡住 UI
++                string startError = null;
++                bool started = false;
++                await Task.Run(() =>
++                {
++                    try
++                    {
++                        started = registry.TryStartCamera(registration, width, height, frameRate, out startError);
++                    }
++                    catch (Exception ex)
++                    {
++                        startError = ex.Message;
++                    }
++                });
++
++                if (!started)
++                {
++                    StopBoothProviderCamera();
++                    LogHelper.WriteLogToFile(
++                        $"[VideoPresenter] 插件摄像头启动失败: {camera.Name}，原因={startError}",
++                        LogHelper.LogType.Warning);
++                    if (VideoPresenterSearchingText != null)
++                    {
++                        VideoPresenterSearchingText.Text = "插件摄像头启动失败";
++                        VideoPresenterSearchingText.Visibility = Visibility.Visible;
++                    }
++                    ShowBoothTransientMessage("插件摄像头启动失败");
++                    return false;
++                }
++
++                _cameraIndexByPage[GetCurrentPageIndex()] = cameraIndex;
++                LogHelper.WriteLogToFile(
++                    $"[VideoPresenter] 插件摄像头预览已启动: {camera.Name}，请求格式={width}×{height}@{frameRate}",
++                    LogHelper.LogType.Info);
++                return true;
++            }
++            catch (Exception ex)
++            {
++                StopBoothProviderCamera();
++                LogHelper.WriteLogToFile(
++                    $"[VideoPresenter] StartProviderCameraPreviewAsync 异常: {ex.Message}",
++                    LogHelper.LogType.Error);
++                return false;
++            }
++        }
++
++        /// <summary>
++        /// 准备插件摄像头画面 Image：把它与 VideoCaptureElement 的 LayoutTransform/RenderTransform
++        /// 指向同一批实例。这样：
++        /// <list type="bullet">
++        /// <item>镜像：SyncBoothMirrorToggles 改 VideoPresenterFullCanvasMirror；</item>
++        /// <item>旋转：VideoPresenterFullCanvasRotation.Angle = RotationAngle * 90；</item>
++        /// <item>缩放/平移：ApplyBoothPreviewTransform 改 VideoPresenterFullCanvasScale/Translate；</item>
++        /// </list>
++        /// 都会同时作用于插件画面，批注缩放/旋转中心与 DirectShow 预览完全一致。
++        /// </summary>
++        private void PrepareProviderImageView()
++        {
++            if (VideoPresenterProviderImage == null) return;
++            if (VideoPresenterFullCanvasImage != null)
++            {
++                if (!ReferenceEquals(VideoPresenterProviderImage.LayoutTransform, VideoPresenterFullCanvasImage.LayoutTransform))
++                {
++                    VideoPresenterProviderImage.LayoutTransform = VideoPresenterFullCanvasImage.LayoutTransform;
++                }
++                if (!ReferenceEquals(VideoPresenterProviderImage.RenderTransform, VideoPresenterFullCanvasImage.RenderTransform))
++                {
++                    VideoPresenterProviderImage.RenderTransform = VideoPresenterFullCanvasImage.RenderTransform;
++                }
++                VideoPresenterProviderImage.RenderTransformOrigin = VideoPresenterFullCanvasImage.RenderTransformOrigin;
++            }
++            VideoPresenterProviderImage.Visibility = Visibility.Visible;
++        }
++
++        /// <summary>停止插件摄像头预览并清理 UI/订阅（幂等）。</summary>
++        private void StopBoothProviderCamera()
++        {
++            bool wasActive = _boothProviderCameraActive;
++            _boothProviderCameraActive = false;
++            _boothProviderFrameRenderPending = false;
++
++            try
++            {
++                CameraProviderRegistry.Instance.FrameSubmitted -= CameraProviderRegistry_FrameSubmitted;
++            }
++            catch (Exception ex)
++            {
++                LogHelper.WriteLogToFile($"[CameraProvider] 取消插件帧订阅失败: {ex.Message}", LogHelper.LogType.Info);
++            }
++
++            if (wasActive)
++            {
++                try
++                {
++                    CameraProviderRegistry.Instance.StopActiveCamera();
++                }
++                catch (Exception ex)
++                {
++                    LogHelper.WriteLogToFile($"[CameraProvider] 停止插件摄像头失败: {ex.Message}", LogHelper.LogType.Warning);
++                }
++            }
++
++            _boothProviderWriteableBitmap = null;
++            try
++            {
++                if (VideoPresenterProviderImage != null)
++                {
++                    VideoPresenterProviderImage.Source = null;
++                    VideoPresenterProviderImage.Visibility = Visibility.Collapsed;
++                }
++            }
++            catch (Exception ex)
++            {
++                LogHelper.WriteLogToFile($"[CameraProvider] 清理插件摄像头画面失败: {ex.Message}", LogHelper.LogType.Info);
++            }
++        }
++
++        /// <summary>
++        /// 插件推帧线程回调：合并高频帧通知，只在 UI 线程渲染最近一帧。
++        /// 插件推帧频率可能高于渲染帧率，这里用 _boothProviderFrameRenderPending 去重。
++        /// </summary>
++        private void CameraProviderRegistry_FrameSubmitted(object sender, EventArgs e)
++        {
++            if (!_boothProviderCameraActive) return;
++            if (_boothProviderFrameRenderPending) return;
++            _boothProviderFrameRenderPending = true;
++            try
++            {
++                Dispatcher.BeginInvoke(new Action(() =>
++                {
++                    _boothProviderFrameRenderPending = false;
++                    RenderBoothProviderFrame();
++                }), DispatcherPriority.Render);
++            }
++            catch (Exception ex)
++            {
++                _boothProviderFrameRenderPending = false;
++                LogHelper.WriteLogToFile($"[CameraProvider] 排队渲染插件帧失败: {ex.Message}", LogHelper.LogType.Info);
++            }
++        }
++
++        /// <summary>
++        /// 在 UI 线程把插件摄像头最近一帧渲染到 VideoPresenterProviderImage。
++        /// 首帧到达时隐藏占位文字、启用拍照按钮（与 DirectShow 的 MediaOpened 语义对齐）。
++        /// </summary>
++        private void RenderBoothProviderFrame()
++        {
++            if (!_boothProviderCameraActive) return;
++            if (VideoPresenterProviderImage == null) return;
++            // 照片预览页不渲染直播帧（与 VideoCaptureElement 在照片页被 Collapsed 的行为一致）
++            if (_boothCurrentPhotoIndex >= 0) return;
++
++            try
++            {
++                var registry = CameraProviderRegistry.Instance;
++                if (!registry.TryGetLatestFrameInfo(out int width, out int height, out int stride, out _))
++                {
++                    return;
++                }
++
++                if (_boothProviderWriteableBitmap == null
++                    || _boothProviderWriteableBitmap.PixelWidth != width
++                    || _boothProviderWriteableBitmap.PixelHeight != height)
++                {
++                    _boothProviderWriteableBitmap = new WriteableBitmap(
++                        width, height, 96, 96, System.Windows.Media.PixelFormats.Bgr24, null);
++                    VideoPresenterProviderImage.Source = _boothProviderWriteableBitmap;
++                }
++
++                if (!registry.RenderLatestFrame(_boothProviderWriteableBitmap))
++                {
++                    return;
++                }
++
++                if (VideoPresenterSearchingText != null
++                    && VideoPresenterSearchingText.Visibility == Visibility.Visible)
++                {
++                    VideoPresenterSearchingText.Visibility = Visibility.Collapsed;
++                }
++                if (BtnCapturePhoto != null) BtnCapturePhoto.IsEnabled = true;
++                if (!_boothMediaOpened)
++                {
++                    _boothMediaOpened = true;
++                    _boothPreviewRestartRetryCount = 0;
++                    LogHelper.WriteLogToFile(
++                        "[VideoPresenter] 插件摄像头首帧已到达，隐藏占位文字",
++                        LogHelper.LogType.Info);
++                }
++            }
++            catch (Exception ex)
++            {
++                LogBoothCallbackException("渲染插件摄像头帧", ex);
++            }
++        }
++
++        /// <summary>
++        /// 插件摄像头列表变化（注册/注销/增删摄像头）：展台打开期间刷新设备下拉框。
++        /// 事件可能在插件线程触发，这里切到 UI 线程执行。
++        /// </summary>
++        private void CameraProviderRegistry_CamerasChanged(object sender, EventArgs e)
++        {
++            try
++            {
++                Dispatcher.BeginInvoke(new Action(() =>
++                {
++                    try
++                    {
++                        if (!_isVideoPresenterSpecialMode) return;
++                        LogHelper.WriteLogToFile(
++                            "[CameraProvider] 插件摄像头列表变化，刷新展台设备下拉框",
++                            LogHelper.LogType.Info);
++                        RefreshVideoPresenterDeviceList();
++                    }
++                    catch (Exception ex)
++                    {
++                        LogHelper.WriteLogToFile($"[CameraProvider] 刷新展台设备列表失败: {ex.Message}", LogHelper.LogType.Warning);
++                    }
++                }));
++            }
++            catch (Exception ex)
++            {
++                LogHelper.WriteLogToFile($"[CameraProvider] 调度设备列表刷新失败: {ex.Message}", LogHelper.LogType.Info);
++            }
++        }
++
+         /// <summary>
+         /// 启动 VideoCaptureElement 预览（DirectShow + VMR9 Renderless + D3DImage 自动渲染）。
+         /// 返回是否成功启动。所有调用必须在 UI 线程上。
+         /// </summary>
+         private Task<bool> StartVideoCaptureElementPreviewAsync(int cameraIndex)
+         {
++            // 兜底：若调用方拿到的是插件摄像头索引（如 1.5s 重启定时器、旋转后恢复预览、
++            // 分辨率下拉框切换等），转发到非 DirectShow 路径，避免去 MultimediaUtil 里找不存在的 DsDevice。
++            if (IsProviderCameraIndex(cameraIndex))
++            {
++                return StartProviderCameraPreviewAsync(cameraIndex);
++            }
++
++            // 若当前是插件摄像头预览，先停掉插件推流并隐藏插件画面，避免两路画面叠加
++            StopBoothProviderCamera();
++
+             // 不要在这里隐藏 SearchingText：
+             // Play() 后到 MediaOpened 触发前有 500-1500ms 的 D3DImage 分配/FilterGraph 构建延迟，
+             // 这段时间用户看到的是纯深色背景，没有任何提示，会以为卡住了。
+@@ -2603,28 +2983,44 @@ namespace Ink_Canvas
+                 // 优先用 _lastFrame（System.Drawing.Bitmap，已应用旋转）；
+                 // 若为 null（NewVideoSample 未触发），用 CaptureCurrentFrame 直接拿 BitmapSource。
+                 Bitmap frame = null;
+-                lock (_videoPresenterFrameLock)
++                // 插件摄像头：始终走第二条路径（取最近帧），避免复用其它路径留下的 _lastFrame
++                // 而漏掉下面的旋转/镜像处理（路径1 假定帧内容已由采样回调旋转好）。
++                if (!_boothProviderCameraActive)
+                 {
+-                    if (_lastFrame != null)
+-                        frame = (Bitmap)_lastFrame.Clone();
++                    lock (_videoPresenterFrameLock)
++                    {
++                        if (_lastFrame != null)
++                            frame = (Bitmap)_lastFrame.Clone();
++                    }
+                 }
+ 
+                 BitmapSource fallbackBitmapSource = null;
+                 if (frame == null && _isVideoPresenterSpecialMode)
+                 {
+-                    // SampleGrabber 路径未填充 _lastFrame，尝试直接从 D3DImage 拿帧
+-                    fallbackBitmapSource = VideoPresenterFullCanvasImage?.CaptureCurrentFrame();
++                    // SampleGrabber 路径未填充 _lastFrame，走第二条路径拿帧：
++                    //   - 插件摄像头（camera provider）：直接取宿主缓存的最近一帧（不依赖 D3DImage）
++                    //   - DirectShow 摄像头：从 D3DImage.CopyBackBuffer 回读
++                    if (_boothProviderCameraActive)
++                    {
++                        fallbackBitmapSource = CameraProviderRegistry.Instance.GetLatestFrameBitmapSource();
++                    }
++                    else
++                    {
++                        fallbackBitmapSource = VideoPresenterFullCanvasImage?.CaptureCurrentFrame();
++                    }
+                     if (fallbackBitmapSource == null)
+                     {
+                         LogHelper.WriteLogToFile(
+-                            "视频展台拍照: _lastFrame 为 null 且 D3DImage 不可用，无法拍照",
++                            "视频展台拍照: _lastFrame 为 null 且第二条路径拿不到帧，无法拍照"
++                            + $"（插件摄像头={_boothProviderCameraActive}）",
+                             LogHelper.LogType.Warning);
+                         // 给用户可见反馈（按钮可能被过早点击，或预览未真正就绪）
+                         ShowBoothTransientMessage("预览未就绪，请稍后再试");
+                         return;
+                     }
+                     LogHelper.WriteLogToFile(
+-                        $"视频展台拍照: 走路径2(D3DImage) BitmapSource={fallbackBitmapSource.PixelWidth}x{fallbackBitmapSource.PixelHeight}",
++                        $"视频展台拍照: 走路径2 BitmapSource={fallbackBitmapSource.PixelWidth}x{fallbackBitmapSource.PixelHeight}"
++                        + $"（插件摄像头={_boothProviderCameraActive}）",
+                         LogHelper.LogType.Trace);
+                 }
+                 else if (frame == null)
+@@ -2910,7 +3306,6 @@ namespace Ink_Canvas
+                 ClearFrozenFrame();
+                 if (VideoPresenterFullCanvasImage != null)
+                 {
+-                    VideoPresenterFullCanvasImage.Visibility = Visibility.Visible;
+                     int page = GetCurrentPageIndex();
+                     int camIdx = -1;
+                     if (_cameraIndexByPage.TryGetValue(page, out int savedIdx)
+@@ -2918,8 +3313,21 @@ namespace Ink_Canvas
+                         camIdx = savedIdx;
+                     if (camIdx < 0 && _cameraService.AvailableCameras.Count > 0)
+                         camIdx = 0;
++
++                    bool providerCamera = IsProviderCameraIndex(camIdx);
++                    VideoPresenterFullCanvasImage.Visibility = providerCamera
++                        ? Visibility.Collapsed
++                        : Visibility.Visible;
++                    if (providerCamera && VideoPresenterProviderImage != null)
++                        VideoPresenterProviderImage.Visibility = Visibility.Visible;
++
+                     if (camIdx >= 0)
+-                        _ = StartVideoCaptureElementPreviewAsync(camIdx);
++                    {
++                        if (providerCamera)
++                            _ = StartProviderCameraPreviewAsync(camIdx);
++                        else
++                            _ = StartVideoCaptureElementPreviewAsync(camIdx);
++                    }
+                 }
+             }
+ 
+@@ -4047,6 +4455,11 @@ namespace Ink_Canvas
+                 }
+                 VideoPresenterFullCanvasImage.Visibility = Visibility.Collapsed;
+             }
++            // 插件摄像头：照片预览页同样隐藏实时画面（推流不断，返回直播页时再恢复）
++            if (VideoPresenterProviderImage != null)
++            {
++                VideoPresenterProviderImage.Visibility = Visibility.Collapsed;
++            }
+ 
+             // 拍照按钮变灰（在照片预览页不允许拍照）
+             if (BtnCapturePhoto != null)
+@@ -4094,20 +4507,9 @@ namespace Ink_Canvas
+                     VideoPresenterFrozenFrameImage.RenderTransform = _frozenFrameOriginalRenderTransform;
+             }
+ 
+-            // 恢复 VideoCaptureElement 实时预览
++            // 恢复实时预览（DirectShow 走 VideoCaptureElement，插件摄像头走 ProviderImage）
+             if (VideoPresenterFullCanvasImage != null && _cameraService != null)
+             {
+-                VideoPresenterFullCanvasImage.Visibility = Visibility.Visible;
+-                // 照片预览页共享了 VideoPresenterFullCanvasRotation，退出时恢复直播画面角度
+-                // （_cameraService.RotationAngle 在照片预览期间未变，直接用它的角度）
+-                if (VideoPresenterFullCanvasRotation != null)
+-                    VideoPresenterFullCanvasRotation.Angle = _cameraService.RotationAngle * 90.0;
+-                // 重置缩放/平移为默认状态（直播页与照片页缩放状态不通用）
+-                _boothPreviewScale = 1.0;
+-                _boothPreviewTranslateX = 0;
+-                _boothPreviewTranslateY = 0;
+-                ApplyBoothPreviewTransform();
+-
+                 int page = GetCurrentPageIndex();
+                 int camIdx = -1;
+                 if (_cameraIndexByPage.TryGetValue(page, out int savedIdx)
+@@ -4119,9 +4521,46 @@ namespace Ink_Canvas
+                 {
+                     camIdx = 0;
+                 }
++
++                bool providerCamera = IsProviderCameraIndex(camIdx);
++                if (providerCamera)
++                {
++                    // 插件摄像头：保持 VideoCaptureElement 隐藏，显示插件画面并重新启动插件推流
++                    VideoPresenterFullCanvasImage.Visibility = Visibility.Collapsed;
++                    if (VideoPresenterProviderImage != null)
++                    {
++                        VideoPresenterProviderImage.Visibility = Visibility.Visible;
++                    }
++                }
++                else
++                {
++                    VideoPresenterFullCanvasImage.Visibility = Visibility.Visible;
++                    if (VideoPresenterProviderImage != null)
++                    {
++                        VideoPresenterProviderImage.Visibility = Visibility.Collapsed;
++                    }
++                }
++
++                // 照片预览页共享了 VideoPresenterFullCanvasRotation，退出时恢复直播画面角度
++                // （_cameraService.RotationAngle 在照片预览期间未变，直接用它的角度）
++                if (VideoPresenterFullCanvasRotation != null)
++                    VideoPresenterFullCanvasRotation.Angle = _cameraService.RotationAngle * 90.0;
++                // 重置缩放/平移为默认状态（直播页与照片页缩放状态不通用）
++                _boothPreviewScale = 1.0;
++                _boothPreviewTranslateX = 0;
++                _boothPreviewTranslateY = 0;
++                ApplyBoothPreviewTransform();
++
+                 if (camIdx >= 0)
+                 {
+-                    _ = StartVideoCaptureElementPreviewAsync(camIdx);
++                    if (providerCamera)
++                    {
++                        _ = StartProviderCameraPreviewAsync(camIdx);
++                    }
++                    else
++                    {
++                        _ = StartVideoCaptureElementPreviewAsync(camIdx);
++                    }
+                 }
+             }
+ 
+diff --git a/Ink Canvas/Plugins/PluginManager.cs b/Ink Canvas/Plugins/PluginManager.cs
+index 7ea4be82..6009a53c 100644
+--- a/Ink Canvas/Plugins/PluginManager.cs	
++++ b/Ink Canvas/Plugins/PluginManager.cs	
+@@ -1060,6 +1060,15 @@ namespace Ink_Canvas.Plugins
+                 {
+                     LogError(string.Format("Plugin {0} raised an error while rolling back failed initialization", info.Name), shutdownEx);
+                 }
++                // Initialize 中途失败时可能已经注册了 camera provider，这里一并清理
++                try
++                {
++                    CameraProviderRegistry.Instance.UnregisterByProviderId(info.Id);
++                }
++                catch (Exception providerCleanupEx)
++                {
++                    LogError(string.Format("Plugin {0} camera provider cleanup failed", info.Name), providerCleanupEx);
++                }
+                 PluginCanvasResourceCleanup.Release(
+                     info.Id,
+                     GetService<ICanvasToolService>(),
+@@ -1223,6 +1232,19 @@ namespace Ink_Canvas.Plugins
+                     LogError(string.Format("Plugin {0} raised an error during Shutdown", plugin.Name), shutdownEx);
+                 }
+ 
++                // 插件卸载时兜底清理它注册的虚拟摄像头提供者（camera provider）：
++                // 停止正在推流的摄像头并从视频展台下拉框移除，避免宿主继续持有插件程序集里的委托
++                // （漏掉这一步会让可回收 AssemblyLoadContext 无法卸载）。
++                // ProviderId 约定等于插件 manifest.Id（见 ICameraProviderService 文档）。
++                try
++                {
++                    CameraProviderRegistry.Instance.UnregisterByProviderId(plugin.Id);
++                }
++                catch (Exception providerCleanupEx)
++                {
++                    LogError(string.Format("Plugin {0} camera provider cleanup failed", plugin.Name), providerCleanupEx);
++                }
++
+                 PluginCanvasResourceCleanup.Release(
+                     plugin.Id,
+                     GetService<ICanvasToolService>(),
+diff --git a/Ink Canvas/Plugins/Services/CameraProviderService.cs b/Ink Canvas/Plugins/Services/CameraProviderService.cs
+new file mode 100644
+index 00000000..cc221b0f
+--- /dev/null
++++ b/Ink Canvas/Plugins/Services/CameraProviderService.cs	
+@@ -0,0 +1,59 @@
++using System;
++
++namespace Ink_Canvas.Plugins
++{
++    /// <summary>
++    /// <see cref="ICameraProviderService"/> 的宿主实现：把插件注册的虚拟摄像头交给
++    /// <see cref="Ink_Canvas.Helpers.CameraProviderRegistry"/>。
++    /// <para>注册表是单例，摄像头服务（<see cref="Ink_Canvas.Helpers.DirectShowCameraService"/>）
++    /// 和视频展台 UI（MainWindow）都直接读取同一个实例，因此这里只做参数校验与转发。</para>
++    /// </summary>
++    internal sealed class CameraProviderService : ICameraProviderService
++    {
++        /// <inheritdoc/>
++        public void RegisterProvider(IPluginCameraProvider provider)
++        {
++            try
++            {
++                Helpers.CameraProviderRegistry.Instance.Register(provider);
++            }
++            catch (Exception ex)
++            {
++                Helpers.LogHelper.WriteLogToFile(
++                    $"[CameraProvider] RegisterProvider 失败: {ex.Message}",
++                    Helpers.LogHelper.LogType.Error);
++                throw;
++            }
++        }
++
++        /// <inheritdoc/>
++        public void UnregisterProvider(IPluginCameraProvider provider)
++        {
++            try
++            {
++                Helpers.CameraProviderRegistry.Instance.Unregister(provider);
++            }
++            catch (Exception ex)
++            {
++                Helpers.LogHelper.WriteLogToFile(
++                    $"[CameraProvider] UnregisterProvider 失败: {ex.Message}",
++                    Helpers.LogHelper.LogType.Error);
++            }
++        }
++
++        /// <inheritdoc/>
++        public void NotifyCamerasChanged(IPluginCameraProvider provider)
++        {
++            try
++            {
++                Helpers.CameraProviderRegistry.Instance.NotifyCamerasChanged(provider);
++            }
++            catch (Exception ex)
++            {
++                Helpers.LogHelper.WriteLogToFile(
++                    $"[CameraProvider] NotifyCamerasChanged 失败: {ex.Message}",
++                    Helpers.LogHelper.LogType.Error);
++            }
++        }
++    }
++}
+diff --git a/InkCanvas.PluginSdk/HostApiRequirement.cs b/InkCanvas.PluginSdk/HostApiRequirement.cs
+index b1ce07b1..a89fc4bc 100644
+--- a/InkCanvas.PluginSdk/HostApiRequirement.cs
++++ b/InkCanvas.PluginSdk/HostApiRequirement.cs
+@@ -1,4 +1,4 @@
+-﻿namespace Ink_Canvas.Plugins
++namespace Ink_Canvas.Plugins
+ {
+     /// <summary>
+     /// 宿主的 API 兼容性要求，由 <see cref="PluginManager"/> 在加载前对所有插件生效。
+@@ -15,7 +15,7 @@
+         /// 仅修复实现、不动接口时不需要改动。
+         /// </para>
+         /// </summary>
+-        public static readonly string CurrentApiVersion = "1.13.0";
++        public static readonly string CurrentApiVersion = "1.14.0";
+ 
+         /// <summary>
+         /// 当前宿主编译版本号，由 Nerdbank.GitVersioning 依据 <c>version.json</c> 与 git 状态自动生成，
+diff --git a/InkCanvas.PluginSdk/ICameraProviderService.cs b/InkCanvas.PluginSdk/ICameraProviderService.cs
+new file mode 100644
+index 00000000..d11e2cda
+--- /dev/null
++++ b/InkCanvas.PluginSdk/ICameraProviderService.cs
+@@ -0,0 +1,233 @@
++using System;
++using System.Collections.Generic;
++
++namespace Ink_Canvas.Plugins
++{
++    /// <summary>
++    /// 摄像头提供者服务（camera provider）：插件把自己采集的画面（网络摄像头、无线视频展台、
++    /// 视频采集卡、屏幕采集等非 DirectShow 来源）交给宿主，让它在内置「视频展台」里
++    /// 和普通 USB 摄像头一样可用。
++    /// <para>工作方式：插件注册一个 <see cref="IPluginCameraProvider"/> 并声明若干虚拟摄像头；
++    /// 宿主把这些摄像头合并进视频展台的摄像头下拉框（与 DirectShow 设备并列）。用户选中后，
++    /// 宿主回调 <see cref="IPluginCameraProvider.StartCamera"/> 并传入一个
++    /// <see cref="IPluginCameraFrameSink"/>，插件只需按自己的节奏把 BGR24 帧
++    /// <see cref="IPluginCameraFrameSink.Submit"/> 进来；渲染、拍照、缩放/旋转/镜像、
++    /// 分辨率下拉框、批注、退出清理全部由宿主负责。</para>
++    /// <para>从注册到出图，插件端最少只需要实现 3 件事：声明摄像头能力、StartCamera 时启动采集、
++    /// 采集线程里 <c>sink.Submit(...)</c>。不需要写任何 DirectShow / COM 代码，
++    /// 也不需要在系统里注册虚拟摄像头。</para>
++    /// <para>与「系统级虚拟 DirectShow 摄像头」的区别：后者对全系统可见、需要写原生 COM 滤波器并注册；
++    /// 本服务只对宿主可见，纯托管、随插件安装/卸载，互不冲突。</para>
++    /// </summary>
++    /// <example>
++    /// 最小接入示例：
++    /// <code>
++    /// // 1) Initialize 阶段注册（所有注册动作都必须在 Initialize 内完成）
++    /// _cameraProvider = host.GetService&lt;ICameraProviderService&gt;();
++    /// _cameraProvider?.RegisterProvider(new MyCameraProvider());
++    ///
++    /// // 2) 插件实现 IPluginCameraProvider
++    /// public IReadOnlyList&lt;PluginCameraDescriptor&gt; GetCameras() =&gt; new[]
++    /// {
++    ///     new PluginCameraDescriptor
++    ///     {
++    ///         Id = "my-booth",
++    ///         DisplayName = "无线视频展台（插件）",
++    ///         Capabilities = new List&lt;PluginCameraCapability&gt;
++    ///         {
++    ///             new PluginCameraCapability { Width = 1920, Height = 1080, FrameRate = 30 },
++    ///             new PluginCameraCapability { Width = 1280, Height = 720, FrameRate = 30 },
++    ///         },
++    ///     },
++    /// };
++    ///
++    /// public bool StartCamera(string cameraId, IPluginCameraFrameSink sink)
++    /// {
++    ///     _sink = sink;                    // 保存 sink，推帧时用它
++    ///     _session = StartCapture();       // 启动你自己的采集（RTSP / 解码 / 等）
++    ///     return true;                     // false = 启动失败，宿主会给用户提示
++    /// }
++    ///
++    /// public void StopCamera(string cameraId)
++    /// {
++    ///     _sink = null;
++    ///     _session?.Stop();                // 尽快返回，不要在这里长时间阻塞
++    /// }
++    ///
++    /// // 3) 采集线程（任意线程）推帧
++    /// void OnFrame(byte[] bgr24, int w, int h)
++    /// {
++    ///     var sink = _sink;
++    ///     if (sink == null) return;
++    ///     int stride = (w * 3 + 3) &amp; ~3;
++    ///     if (!sink.Submit(bgr24, w, h, stride)) { /* false=宿主已停止，可停采集 */ }
++    /// }
++    /// </code>
++    /// </example>
++    public interface ICameraProviderService
++    {
++        /// <summary>
++        /// 注册一个摄像头提供者。必须在插件 <c>Initialize</c> 阶段调用（与工具栏/服务等注册动作一致）。
++        /// <para>重复注册同一 <see cref="IPluginCameraProvider.ProviderId"/> 会覆盖旧的摄像头列表并刷新视频展台下拉框。</para>
++        /// </summary>
++        /// <param name="provider">摄像头提供者实现，不可为 null。</param>
++        /// <exception cref="ArgumentNullException"><paramref name="provider"/> 为 null。</exception>
++        /// <exception cref="ArgumentException"><see cref="IPluginCameraProvider.ProviderId"/> 为空。</exception>
++        void RegisterProvider(IPluginCameraProvider provider);
++
++        /// <summary>
++        /// 注销摄像头提供者：宿主立即停止该提供者正在推流的摄像头（若正在预览），
++        /// 并从视频展台摄像头下拉框中移除它声明的全部摄像头。
++        /// <para>插件通常在 <c>Shutdown</c> 中调用；宿主卸载插件时也会按
++        /// <see cref="IPluginCameraProvider.ProviderId"/> 自动清理，避免残留。</para>
++        /// </summary>
++        /// <param name="provider">要注销的提供者，不可为 null。</param>
++        void UnregisterProvider(IPluginCameraProvider provider);
++
++        /// <summary>
++        /// 通知宿主「该提供者的摄像头列表已变化」（新增/删除/改名/能力变化）。
++        /// 宿主会刷新视频展台的摄像头下拉框；正在预览的摄像头不受影响。
++        /// 可在任意线程调用。摄像头列表未变化时无需调用。
++        /// </summary>
++        /// <param name="provider">摄像头列表已变化的提供者，不可为 null。</param>
++        void NotifyCamerasChanged(IPluginCameraProvider provider);
++    }
++
++    /// <summary>
++    /// 摄像头提供者（由插件实现）。宿主按需调用它来启停插件侧的采集。
++    /// <para>线程约定：<see cref="StartCamera"/> / <see cref="StopCamera"/> /
++    /// <see cref="SetCameraFormat"/> 由宿主在后台线程调用，实现里不要做长耗时阻塞操作
++    /// （启动网络连接之类的异步工作请在实现内部转后台进行，先返回 true 再异步连，首帧到达前
++    /// 宿主显示"正在启动摄像头…"）。<see cref="GetCameras"/> 可能在 UI 线程调用，应快速返回缓存结果。</para>
++    /// <para>生命周期：同一时刻宿主最多只向一路摄像头推流；切换摄像头/分辨率、退出展台、
++    /// 卸载插件时会调用 <see cref="StopCamera"/>。插件必须保证 StopCamera 后不再调用 Submit。</para>
++    /// </summary>
++    public interface IPluginCameraProvider
++    {
++        /// <summary>
++        /// 提供者唯一标识。建议直接用插件 manifest 的 <c>Id</c>（如 <c>com.example.boothcam</c>），
++        /// 宿主会在卸载插件时按它自动清理该提供者注册的摄像头。
++        /// </summary>
++        string ProviderId { get; }
++
++        /// <summary>
++        /// 返回该提供者当前声明的摄像头列表。宿主把它合并进视频展台下拉框。
++        /// 返回空列表表示当前没有可用摄像头（例如设备未连接），此时下拉框不出现条目。
++        /// 列表变化后请调用 <see cref="ICameraProviderService.NotifyCamerasChanged"/>。
++        /// </summary>
++        IReadOnlyList<PluginCameraDescriptor> GetCameras();
++
++        /// <summary>
++        /// 宿主请求开始消费指定摄像头的画面。
++        /// <para>实现应启动采集，并持续通过 <paramref name="sink"/> 推帧，直到
++        /// <see cref="StopCamera"/> 被调用或 <see cref="IPluginCameraFrameSink.Submit"/> 返回 false。</para>
++        /// </summary>
++        /// <param name="cameraId">要启动的摄像头 Id，即 <see cref="PluginCameraDescriptor.Id"/>。</param>
++        /// <param name="sink">帧接收器，线程安全；插件可保存并在采集线程中反复调用。</param>
++        /// <returns>true = 已开始启动；false = 启动失败（宿主会在预览界面提示用户）。
++        /// 即使返回 true，也允许异步连接、稍后才有帧；连续长时间无帧时用户会看到"正在启动摄像头…"。</returns>
++        bool StartCamera(string cameraId, IPluginCameraFrameSink sink);
++
++        /// <summary>
++        /// 宿主请求停止消费指定摄像头的画面。实现应停止采集、释放相关资源，并保证返回后
++        /// 不再调用 <see cref="IPluginCameraFrameSink.Submit"/>。宿主在切换摄像头/分辨率、
++        /// 退出视频展台、卸载插件时调用。
++        /// </summary>
++        /// <param name="cameraId">要停止的摄像头 Id。</param>
++        void StopCamera(string cameraId);
++
++        /// <summary>
++        /// 宿主请求切换采集格式（来自视频展台的分辨率下拉框）。实现可以：
++        /// 调整采集/解码输出尺寸并继续推同一路帧（推荐，无需重启推流）；
++        /// 或返回 false 表示不支持运行时切换，此时宿主仍会重建推流（Stop→Start），
++        /// 并以实际推送的帧尺寸为准渲染（下拉框选择只是期望值）。
++        /// </summary>
++        /// <param name="cameraId">摄像头 Id。</param>
++        /// <param name="width">期望宽度（像素），保证是 <see cref="GetCameras"/> 中声明过的能力组合之一。</param>
++        /// <param name="height">期望高度（像素）。</param>
++        /// <param name="frameRate">期望帧率（FPS）。</param>
++        /// <returns>是否接受该格式。</returns>
++        bool SetCameraFormat(string cameraId, int width, int height, int frameRate);
++    }
++
++    /// <summary>
++    /// 帧接收器：插件把采集到的画面提交给宿主，由宿主负责预览渲染与拍照。
++    /// <para>实现由宿主提供，线程安全，可在任意线程调用。
++    /// 提交的帧必须是 <b>BGR24、top-down</b>（第 0 行 = 图像顶部）的紧密排列像素数据。</para>
++    /// </summary>
++    public interface IPluginCameraFrameSink
++    {
++        /// <summary>
++        /// 当前宿主是否仍在消费该摄像头。返回 false 表示宿主已停止（等价于紧接着会调用
++        /// <see cref="IPluginCameraProvider.StopCamera"/>），插件可以据此结束采集循环。
++        /// </summary>
++        bool IsActive { get; }
++
++        /// <summary>
++        /// 提交一帧画面。
++        /// <para>像素格式固定为 BGR24（每个像素 3 字节，字节序 B、G、R），第 0 行是图像顶部（top-down）。
++        /// stride 为每行字节数，通常取 <c>(width * 3 + 3) &amp; ~3</c>，也可以带额外的行对齐填充；
++        /// 缓冲区长度必须不小于 <c>stride * height</c>。</para>
++        /// <para>宿主会在本次调用返回前完成拷贝，因此实现可以立即复用自己的缓冲区。
++        /// 宿主内部只保留最近一帧（不支持帧队列），推得太快时旧帧会被丢弃，插件不需要自己做节流。</para>
++        /// </summary>
++        /// <param name="bgr24Buffer">BGR24 像素数据，长度至少 <c>stride * height</c>。</param>
++        /// <param name="width">帧宽度（像素），必须 &gt; 0。</param>
++        /// <param name="height">帧高度（像素），必须 &gt; 0。</param>
++        /// <param name="stride">每行字节数，必须 &gt;= <c>width * 3</c>。</param>
++        /// <param name="timestampMs">可选的采集时间戳（毫秒），用于插件侧诊断，宿主当前不据此播放。</param>
++        /// <returns>true = 已接收；false = 宿主已停止或参数非法（插件应停止推帧）。</returns>
++        bool Submit(byte[] bgr24Buffer, int width, int height, int stride, long timestampMs = 0L);
++    }
++
++    /// <summary>
++    /// 插件声明的虚拟摄像头描述。宿主据此在视频展台下拉框中显示名称、填充分辨率下拉框。
++    /// </summary>
++    public sealed class PluginCameraDescriptor
++    {
++        /// <summary>
++        /// 摄像头 Id，在同一提供者内唯一（建议用稳定的英文短标识，如 <c>my-booth</c>）。
++        /// 宿主在 StartCamera/StopCamera/SetCameraFormat 中原样回传。
++        /// </summary>
++        public string Id { get; set; } = "";
++
++        /// <summary>
++        /// 在视频展台摄像头下拉框中显示的名称（用户可见）。
++        /// 建议带上可辨识的后缀，例如 <c>无线视频展台（插件）</c>，与普通 USB 摄像头区分。
++        /// 该名称同时用于记忆"上次选中的摄像头"，应保持稳定。
++        /// </summary>
++        public string DisplayName { get; set; } = "";
++
++        /// <summary>
++        /// 声明的采集能力列表（宽/高/帧率），用于填充视频展台的分辨率下拉框。
++        /// 可以为空：此时分辨率下拉框显示"加载中…"，预览仍按插件实际推送的帧尺寸渲染。
++        /// </summary>
++        public List<PluginCameraCapability> Capabilities { get; set; } = new List<PluginCameraCapability>();
++
++        /// <summary>
++        /// 是否支持类似 DirectShow 摄像头的能力项调节（亮度/对比度/饱和度/色温/增益/焦距/曝光）。
++        /// 当前宿主版本只支持 DirectShow 摄像头的属性调节；插件摄像头请保持 false（默认值），
++        /// 此时展台的属性滑块会自动置灰（与不支持的 USB 摄像头表现一致）。
++        /// </summary>
++        public bool SupportsPropertyControl { get; set; }
++    }
++
++    /// <summary>
++    /// 插件摄像头声明的一种采集能力（宽 × 高 × 帧率）。
++    /// </summary>
++    public sealed class PluginCameraCapability
++    {
++        /// <summary>宽度（像素）。</summary>
++        public int Width { get; set; }
++
++        /// <summary>高度（像素）。</summary>
++        public int Height { get; set; }
++
++        /// <summary>帧率（FPS）；&lt;= 0 时宿主按 30 处理。</summary>
++        public int FrameRate { get; set; }
++
++        /// <summary>返回 <c>1920×1080@30fps</c> 形式的文本，便于日志与调试。</summary>
++        public override string ToString() =>
++            $"{Width}×{Height}" + (FrameRate > 0 ? $"@{FrameRate}fps" : "");
++    }
++}
+diff --git a/InkCanvas.PluginSdk/README.md b/InkCanvas.PluginSdk/README.md
+index ab173bbb..b13f5843 100644
+--- a/InkCanvas.PluginSdk/README.md
++++ b/InkCanvas.PluginSdk/README.md
+@@ -27,6 +27,24 @@ dotnet add package InkCanvas.PluginSdk
+ 
+ - [`InkCanvas.Controls`](https://www.nuget.org/packages/InkCanvas.Controls) — 插件共用的 WPF 控件库（工具栏、颜色选择、设置卡片等）。
+ 
++## 摄像头提供者（camera provider）
++
++从 API 1.14.0 起，插件可以把自行采集的画面（RTSP/网络摄像头/视频展台等非 DirectShow 来源）
++注册进宿主内置「视频展台」的摄像头下拉框，由宿主负责预览、拍照与分辨率切换，
++无需编写原生 COM 或注册系统级虚拟摄像头：
++
++```csharp
++// Initialize 阶段
++var cameraProvider = host.GetService<ICameraProviderService>();
++cameraProvider?.RegisterProvider(new MyCameraProvider());   // 实现 IPluginCameraProvider
++```
++
++实现 `IPluginCameraProvider` 后，在 `StartCamera(cameraId, sink)` 中保存 `sink`，采集线程调用
++`sink.Submit(bgr24Buffer, width, height, stride)` 即可推帧（BGR24 / top-down）。
++接口与类型：`ICameraProviderService`、`IPluginCameraProvider`、`IPluginCameraFrameSink`、
++`PluginCameraDescriptor`、`PluginCameraCapability`。
++章节说明见仓库 `docs/camera-provider.md`，接口清单见 `rules/plugin_sdk.md`。
++
+ ## 资源
+ 
+ - 项目主页：<https://github.com/InkCanvasForClass/community>
+diff --git a/docs/camera-provider.md b/docs/camera-provider.md
+new file mode 100644
+index 00000000..69f9bd37
+--- /dev/null
++++ b/docs/camera-provider.md
+@@ -0,0 +1,243 @@
++# 插件摄像头提供者（Camera Provider）
++
++> 适用宿主：ICCCE ≥ 1.8.0.11（`HostApiRequirement.CurrentApiVersion` ≥ 1.14.0）
++> 相关接口：`ICameraProviderService`、`IPluginCameraProvider`、`IPluginCameraFrameSink`、`PluginCameraDescriptor`、`PluginCameraCapability`
++
++## 1. 这个能力解决什么问题
++
++宿主的「视频展台」摄像头下拉框原本只有一条数据来源：DirectShow
++`FilterCategory.VideoInputDevice` 枚举。任何非 DirectShow 的画面来源（网络摄像头、
++无线视频展台、RTSP/HTTP 流、视频采集卡自定义 SDK、屏幕采集……）都无法进入这个下拉框——
++除非在系统层注册一个虚拟 DirectShow 摄像头（原生 COM + 注册表），代价是对全系统可见、
++需要原生代码、还要处理 VMR9/D3D 渲染协商。
++
++**摄像头提供者（camera provider）** 让插件把自己采集的帧直接交给宿主：
++
++```
++插件采集（RTSP/H.264/...）
++        │  byte[] BGR24 帧
++        ▼
++IPluginCameraFrameSink.Submit()
++        │
++        ▼
++宿主 CameraProviderRegistry（最近一帧缓存）
++        │
++        ├── 视频展台全屏预览：WPF Image（与 VideoCaptureElement 共享缩放/旋转/镜像变换）
++        └── 拍照：取最近一帧 → 现有「插入画布 / 照片栏」逻辑
++```
++
++插件不需要写任何 DirectShow/COM 代码，也不需要管理员权限或系统级注册；摄像头只对宿主可见，
++随插件安装/卸载。
++
++## 2. 最小接入（3 步）
++
++### 2.1 实现 `IPluginCameraProvider`
++
++```csharp
++using Ink_Canvas.Plugins;
++
++public sealed class MyCameraProvider : IPluginCameraProvider
++{
++    // 建议直接复用插件 manifest 的 Id：宿主卸载插件时会把该 Id 作为清理依据
++    public string ProviderId => "com.example.boothcam";
++
++    private IPluginCameraFrameSink _sink;
++    private MyCaptureSession _session;
++
++    public IReadOnlyList<PluginCameraDescriptor> GetCameras() => new[]
++    {
++        new PluginCameraDescriptor
++        {
++            Id = "my-booth",
++            // 建议带可辨识后缀，与普通 USB 摄像头区分；该名称也会写入"上次选中的摄像头"
++            DisplayName = "无线视频展台（插件）",
++            Capabilities = new List<PluginCameraCapability>
++            {
++                new PluginCameraCapability { Width = 1920, Height = 1080, FrameRate = 30 },
++                new PluginCameraCapability { Width = 1280, Height = 720,  FrameRate = 30 },
++            },
++            // 当前宿主版本只支持 DirectShow 摄像头的属性调节，保持 false → 展台属性滑块自动置灰
++            SupportsPropertyControl = false,
++        },
++    };
++
++    public bool StartCamera(string cameraId, IPluginCameraFrameSink sink)
++    {
++        if (cameraId != "my-booth") return false;
++        _sink = sink;
++        // 启动采集；网络连接放到后台线程，先返回 true（宿主显示"正在启动摄像头…"直到首帧到达）
++        _ = Task.Run(async () =>
++        {
++            _session = await MyCaptureSession.StartAsync();
++            _session.FrameReady += OnFrame;   // 采集内核回调（后台线程）
++            await _session.ConnectAndStreamAsync();
++        });
++        return true;
++    }
++
++    public void StopCamera(string cameraId)
++    {
++        _sink = null;
++        var session = _session;
++        _session = null;
++        session?.Stop();          // 尽快返回，不要在这里长时间阻塞
++    }
++
++    public bool SetCameraFormat(string cameraId, int width, int height, int frameRate)
++    {
++        // 能即时切换就返回 true；不支持就返回 false（宿主会重建推流，并按实际帧尺寸渲染）
++        return _session?.RequestFormat(width, height, frameRate) ?? false;
++    }
++
++    private void OnFrame(MyFrame frame)
++    {
++        var sink = _sink;
++        if (sink == null) return;
++        // frame.Buffer 为 BGR24、top-down，stride = (w*3+3)&~3
++        if (!sink.Submit(frame.Buffer, frame.Width, frame.Height, frame.Stride, frame.TimestampMs))
++        {
++            // false = 宿主已停止（切换摄像头/退出展台/卸载插件），插件可以停采集
++        }
++    }
++}
++```
++
++### 2.2 在 `Initialize` 中注册
++
++```csharp
++[PluginEntrance]
++public sealed class MyCameraPlugin : PluginBase
++{
++    private ICameraProviderService _cameraProvider;
++    private MyCameraProvider _provider;
++
++    public override void Initialize(IPluginHost host)
++    {
++        base.Initialize(host);
++
++        // 与工具栏/服务注册一致：所有注册动作必须在 Initialize 内完成
++        _cameraProvider = host.GetService<ICameraProviderService>();
++        _provider = new MyCameraProvider();
++        _cameraProvider?.RegisterProvider(_provider);
++    }
++
++    public override void Shutdown()
++    {
++        _cameraProvider?.UnregisterProvider(_provider);   // 宿主卸载插件时也会兜底清理
++    }
++}
++```
++
++### 2.3 打开展台并预选（可选）
++
++```csharp
++// 1) 写"上次选中的摄像头"（大小写不敏感匹配 DisplayName）
++Host.GetService<ISettingsService>()?
++    .Set("Canvas.VideoPresenterLastCameraName", "无线视频展台（插件）");
++
++// 2) 打开内置视频展台（主窗口内联全屏预览）
++Host.GetService<IVideoBoothService>()?.Toggle();
++```
++
++完成。用户打开「视频展台」→ 摄像头下拉框里就能看到「无线视频展台（插件）」，
++选中即可预览、拍照、切分辨率，展台原有的缩放/旋转/镜像/批注/照片栏全部照常工作。
++
++## 3. API 参考
++
++### 3.1 `ICameraProviderService`
++
++通过 `host.GetService<ICameraProviderService>()` 获取（宿主单例）。
++
++| 成员 | 说明 |
++|------|------|
++| `RegisterProvider(IPluginCameraProvider)` | 注册提供者（必须在 `Initialize` 调用）。重复注册同一 `ProviderId` 会覆盖。 |
++| `UnregisterProvider(IPluginCameraProvider)` | 注销：立即停止其推流并从下拉框移除全部摄像头。 |
++| `NotifyCamerasChanged(IPluginCameraProvider)` | 摄像头列表变化（增删/改名/能力变化）后调用，宿主刷新下拉框；任意线程可调。 |
++
++### 3.2 `IPluginCameraProvider`（插件实现）
++
++| 成员 | 线程 | 说明 |
++|------|------|------|
++| `string ProviderId` | 任意 | 唯一标识，建议 = 插件 `manifest.Id`。宿主卸载插件时按它兜底清理。 |
++| `IReadOnlyList<PluginCameraDescriptor> GetCameras()` | UI 线程 | 快速返回缓存的摄像头列表；可为空列表（设备未连接）。 |
++| `bool StartCamera(string cameraId, IPluginCameraFrameSink sink)` | 后台线程 | 启动采集并保存 `sink`。返回 `false` = 启动失败（宿主提示用户）。允许先返回 `true` 再异步连接。 |
++| `void StopCamera(string cameraId)` | 后台线程 | 停止采集、释放资源；返回后不得再调用 `Submit`。 |
++| `bool SetCameraFormat(string cameraId, int w, int h, int fps)` | 后台线程 | 分辨率下拉框切换时调用；返回 `false` 表示不支持运行时切换（宿主会重建推流，按实际帧尺寸渲染）。 |
++
++生命周期：**同一时刻宿主最多向一路摄像头推流**。切换摄像头、切换分辨率、退出展台、
++卸载插件都会调用 `StopCamera`。
++
++### 3.3 `IPluginCameraFrameSink`（宿主实现，插件调用）
++
++```csharp
++bool IsActive { get; }
++bool Submit(byte[] bgr24Buffer, int width, int height, int stride, long timestampMs = 0L);
++```
++
++- **像素格式固定 BGR24**（字节序 B、G、R），**top-down**（第 0 行 = 图像顶部）。
++- `stride >= width * 3`，通常取 `(width * 3 + 3) & ~3`；缓冲区长度必须 ≥ `stride * height`。
++- 宿主在 `Submit` 返回前完成拷贝：插件可以立即复用缓冲区。
++- 宿主只保留最近一帧（不支持帧队列），推快了旧帧会被丢弃，插件不需要自己节流。
++- 返回 `false` = 宿主已停止或参数非法，插件应结束推帧（等价于紧接着收到 `StopCamera`）。
++
++### 3.4 `PluginCameraDescriptor` / `PluginCameraCapability`
++
++- `Id`：摄像头 Id，同一提供者内唯一。
++- `DisplayName`：下拉框显示名，建议带「（插件）」之类后缀；也是"上次选中的摄像头"的持久化值。
++- `Capabilities`：`Width/Height/FrameRate` 列表，用于填充分辨率下拉框；为空时下拉框显示
++  "加载中…"，预览仍按实际推送的帧尺寸渲染。
++- `SupportsPropertyControl`：保留字段；当前宿主版本对插件摄像头不做 DirectShow 属性映射，
++  保持 `false`（默认）即可，展台属性滑块会自动置灰。
++
++## 4. 宿主侧实现（给维护者）
++
++| 位置 | 改动 |
++|------|------|
++| `InkCanvas.PluginSdk/ICameraProviderService.cs` | 新增 SDK 接口与 DTO；`HostApiRequirement.CurrentApiVersion` 1.13.0 → 1.14.0 |
++| `Ink Canvas/Helpers/CameraProviderRegistry.cs` | 提供者注册表 + `IPluginCameraFrameSink` 实现（双缓冲最近帧）+ 活动推流生命周期 |
++| `Ink Canvas/Plugins/Services/CameraProviderService.cs` | SDK 服务的宿主实现（DI 单例） |
++| `Ink Canvas/App.xaml.cs` | 注册 `ICameraProviderService` |
++| `Ink Canvas/Helpers/DirectShowCameraService.cs` | 下拉框列表合并插件摄像头；`EnumerateResolutionsAsync` 用插件能力；`StartPreviewAsync` 分支转发帧到 `FrameReceived`；属性探测短路 |
++| `Ink Canvas/MainWindow.xaml` | 新增 `VideoPresenterProviderImage`（WPF `Image`） |
++| `Ink Canvas/MainWindow_cs/MW_VideoPresenter.cs` | 非 DirectShow 渲染路径、拍照取最近帧、生命周期与列表刷新 |
++| `Ink Canvas/Plugins/PluginManager.cs` | 插件卸载时按 `ProviderId` 兜底清理 |
++
++渲染细节：
++
++- 全屏预览时 `VideoPresenterProviderImage` 的 `LayoutTransform` / `RenderTransform` 会被**指向
++  `VideoCaptureElement` 的同名实例**，因此以下既有逻辑对插件画面同样生效，无需分支：
++  - `VideoPresenterFullCanvasMirror`（水平/垂直镜像）
++  - `VideoPresenterFullCanvasRotation`（旋转 90°×N）
++  - `VideoPresenterFullCanvasScale` / `Translate`（`ApplyBoothPreviewTransform` 的缩放/平移）
++  - 墨迹批注、照片预览页的变换复用（照片页会 Collapsed 实时画面，插件画面同样隐藏）
++- 帧到达时在插件线程触发事件，UI 线程用合并标志去重后 `WriteableBitmap.WritePixels` 渲染；
++  尺寸变化时自动重建 `WriteableBitmap`。
++- 拍照：`BtnCapturePhoto_Click` 在插件摄像头激活时取
++  `CameraProviderRegistry.GetLatestFrameBitmapSource()`，随后走**现有的**旋转/镜像/纸框矫正/
++  插入画布/照片栏逻辑，不依赖 D3D 回读。
++- 属性滑块：`ProbeCameraPropertiesAsync` 对插件摄像头直接返回"全部不支持"，滑块置灰。
++- 分辨率：`AllResolutionFpsCombos` 由插件能力填充，默认选中与 1920×1080 曼哈顿距离最小的能力项，
++  与 DirectShow 路径一致。
++
++## 5. 与两条既有路径的对比
++
++| | DirectShow USB 摄像头 | 虚拟 DirectShow 摄像头（系统级） | **Camera Provider（本功能）** |
++|---|---|---|---|
++| 进入宿主下拉框 | ✅ 原生 | ✅ 系统层注册 | ✅ 宿主内注册 |
++| 预览渲染 | VMR9 + D3DImage | VMR9 + D3DImage | WPF Image + 插件推帧 |
++| 拍照 | D3DImage 回读 | D3DImage 回读 | 取最近一帧 |
++| 分辨率/旋转/镜像/批注 | ✅ | ✅ | ✅（共享同一套变换） |
++| 需要原生 COM / 注册表 | — | ✅ | ❌ |
++| 对全系统可见 | — | ✅ | ❌（仅宿主） |
++| 与 OBS 等虚拟设备冲突 | — | 可能 | 不会 |
++| 需要宿主发版 | — | 否 | **是**（本 PR） |
++
++## 6. 已知限制
++
++1. 只在宿主内可见：相机/会议软件看不到插件摄像头（通常正是想要的效果）。
++2. 属性调节（亮度/对比度/…）当前不支持，展台滑块置灰。
++3. 宿主只保留最近一帧，不做帧队列/时间戳播放；插件按自己的节奏推即可。
++4. 首帧到达前宿主显示"正在启动摄像头…"；插件长时间无帧时用户看到的是占位文字，
++   不像 DirectShow 那样有 `MediaFailed` 自动重试链。
++5. 插件必须在 `Initialize` 阶段注册；插件热加载后展台下拉框会通过
++   `CameraRegistry.CamerasChanged` 刷新，无需重启宿主。
+diff --git a/rules/plugin_sdk.md b/rules/plugin_sdk.md
+index 092ee4f3..b743e5b1 100644
+--- a/rules/plugin_sdk.md
++++ b/rules/plugin_sdk.md
+@@ -134,7 +134,7 @@ SecurityVerdict verdict = host.EvaluateTrust(packagePath, expectedSha256, declar
+ 
+ ## 宿主提供的服务（经 DI 获取）
+ 
+-约 38 个 `I*Service` 接口，按能力分组。插件通过 `host.GetService<T>()` 获取。
++约 45 个 `I*Service` 接口，按能力分组。插件通过 `host.GetService<T>()` 获取。
+ 
+ ### 画布 / 墨迹
+ 
+@@ -190,12 +190,40 @@ SecurityVerdict verdict = host.EvaluateTrust(packagePath, expectedSha256, declar
+ | `ICanvasCoordinateService` | 屏幕物理像素与画布 DIP 坐标互转，处理当前 DPI、多屏和负坐标 |
+ | `IInkTextService` | 将文字渲染为 `StrokeCollection` 或直接作为可撤销真实墨迹插入画布 |
+ | `ICameraService` | 摄像头 |
++| `ICameraProviderService` | 插件摄像头提供者：把插件采集的画面注册进视频展台摄像头下拉框，宿主负责预览/拍照/分辨率（见下文） |
+ | `INameRosterService` | 花名册 |
+ | `IUpdateService` | 应用更新（`PluginUpdateChannel`） |
+ | `IEventService` | 宿主事件订阅（`TopMostChanged`/`AppExiting`/`CanvasInkChanged` 等） |
+ | `IPluginCanvasGestureHandler` | 画布手势处理（作为接口由宿主识别并回调） |
+ 
+-## 深链接：icc://plugin/...
++## 插件摄像头提供者（camera provider，API ≥ 1.14.0）
++
++插件把自己采集的画面（RTSP、视频展台、采集卡、屏幕采集等非 DirectShow 来源）注册成
++宿主「视频展台」摄像头下拉框里的一个摄像头条目，由宿主负责全屏预览、拍照、分辨率切换、
++缩放/旋转/镜像/批注与生命周期。**不需要写原生 COM、不需要注册系统级虚拟摄像头、无需管理员权限。**
++完整说明见 [`docs/camera-provider.md`](../docs/camera-provider.md)。
++
++```csharp
++// Initialize 阶段注册
++var cameraProvider = host.GetService<ICameraProviderService>();
++cameraProvider?.RegisterProvider(new MyCameraProvider());   // 实现 IPluginCameraProvider
++```
++
++要点：
++
++- `IPluginCameraProvider.ProviderId` 建议直接用插件 `manifest.Id`：宿主卸载插件时按它兜底清理。
++- `GetCameras()` 返回 `PluginCameraDescriptor[]`（Id / DisplayName / Capabilities），
++  宿主据此填下拉框与分辨率下拉框；`DisplayName` 建议带「（插件）」后缀以便与 USB 摄像头区分。
++- `StartCamera(cameraId, sink)` 启动采集并保存 `sink`；采集线程调用
++  `sink.Submit(byte[] bgr24, width, height, stride, timestampMs)` 推帧。
++  像素格式固定 **BGR24 / top-down**，`stride = (w*3+3)&~3`。
++- `StopCamera` 应尽快返回；返回后不得再 `Submit`（`Submit` 返回 false 也意味着应停采集）。
++- 分辨率下拉框由 `Capabilities` 填充；`SetCameraFormat` 返回 false 时宿主会重建推流，
++  并按实际帧尺寸渲染。
++- 属性调节（亮度/对比度等）当前对插件摄像头不生效，展台属性滑块自动置灰。
++- 与 DirectShow 虚拟摄像头路线互不冲突，可长期共存：本接口只对宿主可见，随插件安装/卸载。
++
++
+ 
+ 插件可注册 URI 处理器，宿主把 `icc://plugin/<pluginId>/<subPath>?<query>` 派发给对应插件。
+ 
