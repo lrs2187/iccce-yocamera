@@ -365,6 +365,8 @@ public sealed class FfmpegProcessFrameSource : IFrameSource
 
     private IReadOnlyList<string> BuildArguments(string transport)
     {
+        var ver = GetFfmpegVersion();
+
         var args = new List<string>
         {
             "-hide_banner", "-loglevel", "warning", "-nostdin",
@@ -374,8 +376,12 @@ public sealed class FfmpegProcessFrameSource : IFrameSource
             "-flags", "low_delay",
             "-max_delay", "1000000",
             "-buffer_size", "1655360",
-            "-timeout", ((long)(_options.RtpTimeout.TotalMilliseconds * 1000)).ToString(System.Globalization.CultureInfo.InvariantCulture),
         };
+
+        // RTSP socket 超时参数名随 FFmpeg 版本变化：
+        //   4.x/5.x 用 -stimeout（厂商 4.0.1 用的是它）；6.x 起改为 -timeout，7.x 移除 stimeout。
+        args.Add(ver != null && ver >= new Version(5, 0) ? "-timeout" : "-stimeout");
+        args.Add(((long)(_options.RtpTimeout.TotalMilliseconds * 1000)).ToString(System.Globalization.CultureInfo.InvariantCulture));
 
         IPAddress? local = _options.LocalBindAddress;
         if (local != null && !local.Equals(IPAddress.Any))
@@ -401,12 +407,73 @@ public sealed class FfmpegProcessFrameSource : IFrameSource
         {
             "-an", "-sn", "-dn",
             "-vf", $"scale={_options.Width}:{_options.Height}:flags=fast_bilinear",
-            "-fps_mode", "passthrough",
+        });
+
+        // 恒定帧率/直通参数：ffmpeg 5.1 起是 -fps_mode，更早（含厂商 4.0.1）是 -vsync。
+        // 不传的话 ffmpeg 会按默认 vsync 复制/丢帧，rawvideo 管道里会造成帧数抖动。
+        if (ver != null && ver >= new Version(5, 1))
+        {
+            args.Add("-fps_mode");
+            args.Add("passthrough");
+        }
+        else
+        {
+            args.Add("-vsync");
+            args.Add("0");
+        }
+
+        args.AddRange(new[]
+        {
             "-f", "rawvideo",
             "-pix_fmt", "bgr24",
             "pipe:1",
         });
         return args;
+    }
+
+    private static readonly ConcurrentDictionary<string, Version> s_ffmpegVersion =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 探测 ffmpeg 主次版本（缓存）。教室机器上常见驿欧套件自带的 FFmpeg 4.0.1，
+    /// 与新版（5.1+/6+/7+/8）的参数名不同，必须按版本选择。
+    /// 探测失败返回 null，调用方走最保守（4.x 兼容）参数。
+    /// </summary>
+    private Version GetFfmpegVersion()
+    {
+        if (s_ffmpegVersion.TryGetValue(_ffmpegPath, out Version cached)) return cached;
+        Version parsed = null;
+        try
+        {
+            var psi = new ProcessStartInfo(_ffmpegPath, "-version")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            using var p = Process.Start(psi);
+            string line = p?.StandardOutput.ReadLine();
+            if (!string.IsNullOrEmpty(line))
+            {
+                var m = System.Text.RegularExpressions.Regex.Match(line, @"ffmpeg version\s+(\d+)\.(\d+)");
+                if (m.Success)
+                    parsed = new Version(int.Parse(m.Groups[1].Value), int.Parse(m.Groups[2].Value));
+            }
+            try { if (p != null && !p.HasExited) p.Kill(); } catch { }
+        }
+        catch { /* 探测失败按 4.x 保守参数处理 */ }
+
+        if (parsed != null)
+        {
+            s_ffmpegVersion[_ffmpegPath] = parsed;
+            _log?.Invoke($"[ffmpeg] 版本探测：{Path.GetFileName(_ffmpegPath)} = {parsed.Major}.{parsed.Minor}");
+        }
+        else
+        {
+            _log?.Invoke($"[ffmpeg] 版本探测失败，按 4.x 兼容参数启动（{Path.GetFileName(_ffmpegPath)}）");
+        }
+        return parsed;
     }
 
     private void SetState(FrameSourceState state)

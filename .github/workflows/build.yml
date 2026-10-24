@@ -1,0 +1,57 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: 构建 Core
+        run: dotnet build src/YiouCamera.Core/YiouCamera.Core.csproj -c Release
+
+      - name: 安装 ILRepack（把 Core 合并进插件入口 dll）
+        run: dotnet tool install --global dotnet-ilrepack
+
+      - name: 构建 Plugin
+        run: dotnet build src/YiouCamera.Plugin/YiouCamera.Plugin.csproj -c Release
+
+      - name: 校验插件产物（3 文件，且不含禁用程序集）
+        shell: pwsh
+        run: |
+          $bin = "src/YiouCamera.Plugin/bin/Release/net10.0-windows10.0.19041.0"
+          $need = @("manifest.json", "YiouCamera.Plugin.dll", "YiouCamera.Plugin.deps.json")
+          foreach ($f in $need) {
+            if (-not (Test-Path (Join-Path $bin $f))) { throw "缺少产物: $f" }
+          }
+          $forbidden = @("InkCanvas.PluginSdk.dll", "InkCanvas.Controls.dll", "WinRT.Runtime.dll", "Microsoft.Windows.SDK.NET.dll")
+          foreach ($f in $forbidden) {
+            if (Test-Path (Join-Path $bin $f)) { throw "产物里出现不应分发的程序集: $f" }
+          }
+          # Core 应已被 ILRepack 合并进入口 dll
+          if (Test-Path (Join-Path $bin "YiouCamera.Core.dll")) {
+            Write-Warning "Core 未合并进入口 dll（ILRepack 可能未生效），安装时会多一个文件"
+          }
+          Get-ChildItem $bin -File | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: 安装 ffmpeg（仿真器 selftest 需要）
+        run: choco install ffmpeg -y --no-progress
+
+      - name: 构建设备仿真器（无真机联调工具）
+        run: dotnet build tests/Simulator/YiouCamera.Simulator.csproj -c Release
+
+      - name: 仿真器自检
+        run: dotnet run --project tests/Simulator/YiouCamera.Simulator.csproj -c Release -- --selftest

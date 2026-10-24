@@ -1,5 +1,9 @@
 # iccce-yocamera
 
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/tag/lrs2187/iccce-yocamera?label=release)](https://github.com/lrs2187/iccce-yocamera/tags)
+[![Build](https://github.com/lrs2187/iccce-yocamera/actions/workflows/build.yml/badge.svg)](https://github.com/lrs2187/iccce-yocamera/actions/workflows/build.yml)
+
 把 **驿欧无线视频展台**（YiouBoard 2.0 的无线实物展台，只输出 WiFi RTSP 流）接入
 [ICCCE / InkCanvasForClass-CE](https://github.com/InkCanvasForClass/community) 的内置视频展台。
 
@@ -9,6 +13,12 @@
 - **零系统安装**：不注册任何虚拟摄像头、不写注册表、不需要管理员权限
 - **不需要物理摄像头**
 - **只对 ICCCE 可见**：其它软件（相机、会议软件）看不到这个"摄像头"
+
+```powershell
+git clone https://github.com/lrs2187/iccce-yocamera.git
+cd iccce-yocamera
+pwsh -File tools\build-all.ps1
+```
 
 ## 为什么要 `patched-host`
 
