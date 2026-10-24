@@ -1,0 +1,10 @@
+<Project>
+
+  <!-- 全仓库统一的许可与版权元数据（ICCCE PluginSdk 为 GPL-3.0-only，链接它的插件需同许可） -->
+  <PropertyGroup>
+    <Copyright>Copyright (C) 2026 iccce-yocamera contributors</Copyright>
+    <PackageLicenseExpression>GPL-3.0-only</PackageLicenseExpression>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+
+</Project>

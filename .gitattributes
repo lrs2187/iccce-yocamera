@@ -1,0 +1,18 @@
+# 统一换行：仓库内文本统一 LF，Windows 脚本/解决方案保留 CRLF
+* text=auto eol=lf
+
+*.ps1   text eol=crlf
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+*.sln   text eol=crlf
+*.csproj text eol=crlf
+*.cs    text diff=csharp
+*.md    text
+*.json  text
+
+# 二进制
+*.png   binary
+*.jpg   binary
+*.dll   binary
+*.exe   binary
+*.patch binary
